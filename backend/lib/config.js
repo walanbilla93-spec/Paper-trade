@@ -77,12 +77,9 @@ function clampSettings(s) {
   out.rejectVolumeDeltaConflict = out.rejectVolumeDeltaConflict !== false;
   out.minTurnover24h = Math.max(0, parseNumber(out.minTurnover24h, DEFAULTS.minTurnover24h));
   out.maxSignalAgeMinutes = Math.max(1, Math.min(120, parseNumber(out.maxSignalAgeMinutes, DEFAULTS.maxSignalAgeMinutes)));
-  if (out.safeMode) {
-    out.minScoreToTrade = Math.max(70, out.minScoreToTrade);
-    out.maxOpenTrades = Math.min(out.maxOpenTrades, 3);
-    out.leverage = Math.min(out.leverage, 1);
-    out.maxTradeUsdt = Math.min(out.maxTradeUsdt, 5);
-  }
+  // Safe Mode is now a preset, not a permanent clamp.
+  // Applying /bot/safe-mode writes conservative values once, but later custom
+  // settings must be saved exactly instead of being forced back to 5 USDT / 1x / 3 trades.
   out.updatedAt = out.updatedAt || Date.now();
   return out;
 }
