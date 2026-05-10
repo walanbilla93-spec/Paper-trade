@@ -171,7 +171,7 @@ async function setLeverageSafe(symbol, leverage) {
 
 async function setTradingStopSafe(plan) {
   try {
-    let data = await bybitPost('/v5/position/trading-stop', {
+    const data = await bybitPost('/v5/position/trading-stop', {
       category: 'linear',
       symbol: plan.symbol,
       tpslMode: 'Full',
@@ -183,25 +183,6 @@ async function setTradingStopSafe(plan) {
       tpOrderType: 'Market',
       slOrderType: 'Market',
     });
-
-    if (data.retCode !== 0 && data.retMsg && data.retMsg.toLowerCase().includes('positionidx')) {
-      // Retry with Hedge Mode index (1 for Buy, 2 for Sell)
-      const isBuy = (plan.bybitSide || plan.side) === 'Buy' || plan.side === 'BUY';
-      const hedgeIdx = isBuy ? 1 : 2;
-      data = await bybitPost('/v5/position/trading-stop', {
-        category: 'linear',
-        symbol: plan.symbol,
-        tpslMode: 'Full',
-        positionIdx: hedgeIdx,
-        takeProfit: String(plan.tp1),
-        stopLoss: String(plan.sl),
-        tpTriggerBy: 'LastPrice',
-        slTriggerBy: 'LastPrice',
-        tpOrderType: 'Market',
-        slOrderType: 'Market',
-      });
-    }
-
     return { ok: data.retCode === 0, data };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -280,15 +261,10 @@ async function executeSignal(signalInput, opts = {}) {
     orderLinkId,
     reduceOnly: false,
     closeOnTrigger: false,
-    takeProfit: String(plan.tp1),
-    stopLoss: String(plan.sl),
-    tpslMode: 'Full',
-    tpOrderType: 'Market',
-    slOrderType: 'Market',
   };
   if (plan.orderType === 'Limit') body.price = String(plan.entry);
 
-  addLog('PLACE_ATTEMPT', `${plan.orderType} ${plan.bybitSide} ${plan.symbol} qty ${plan.qty}`, { plan, body, note: 'TP/SL included in order request' });
+  addLog('PLACE_ATTEMPT', `${plan.orderType} ${plan.bybitSide} ${plan.symbol} qty ${plan.qty}`, { plan, body, note: 'TP/SL intentionally attached after fill by reconciler' });
   const data = await bybitPost('/v5/order/create', body);
   if (data.retCode !== 0) {
     addLog('REJECTED', `Bybit rejected ${plan.symbol}: ${data.retMsg}`, { retCode: data.retCode, body, response: data });
@@ -337,24 +313,22 @@ async function executeSignal(signalInput, opts = {}) {
   saveTrades(trades);
   addLog('PLACED', `Placed ${plan.symbol} order ${orderId}`, { trade });
 
-  // Orders may fill quickly, but TP/SL must only be attached after Bybit confirms a position.
+  // Market orders may fill quickly, but TP/SL must only be attached after Bybit confirms a position.
   // The reconciler is the source of truth; this delayed attempt is best-effort only.
-  // We attempt it for both Market and Limit orders as limit orders may also fill immediately (e.g. crossing the spread).
-  setTimeout(async () => {
-    const stop = await setTradingStopSafe(plan);
-    const ts = getTrades();
-    if (ts[tradeId]) {
-      ts[tradeId].tpslSetAttemptedAt = Date.now();
-      ts[tradeId].tpslAttached = !!stop.ok;
-      ts[tradeId].tpslResult = stop;
-      ts[tradeId].updatedAt = Date.now();
-      saveTrades(ts);
-      // Suppress WARN for limit orders that genuinely haven't filled yet.
-      if (!stop.ok && plan.orderType === 'Market') {
-        addLog('WARN', `TP/SL attach not confirmed for ${plan.symbol}`, stop);
+  if (plan.orderType === 'Market') {
+    setTimeout(async () => {
+      const stop = await setTradingStopSafe(plan);
+      const ts = getTrades();
+      if (ts[tradeId]) {
+        ts[tradeId].tpslSetAttemptedAt = Date.now();
+        ts[tradeId].tpslAttached = !!stop.ok;
+        ts[tradeId].tpslResult = stop;
+        ts[tradeId].updatedAt = Date.now();
+        saveTrades(ts);
+        if (!stop.ok) addLog('WARN', `TP/SL attach not confirmed for ${plan.symbol}`, stop);
       }
-    }
-  }, 1600).unref?.();
+    }, 1600).unref?.();
+  }
 
   return { ok: true, trade, plan, orderId, raw: data.result };
 }

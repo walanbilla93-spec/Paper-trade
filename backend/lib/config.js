@@ -22,7 +22,7 @@ const DEFAULTS = Object.freeze({
   safeMode: parseBool(process.env.SAFE_MODE, true),
   oneTradePerSymbol: parseBool(process.env.ONE_TRADE_PER_SYMBOL, true),
   rejectUnknownBtcRegime: parseBool(process.env.REJECT_UNKNOWN_BTC_REGIME, false),
-  rejectTrendConflict: parseBool(process.env.REJECT_TREND_CONFLICT, false),
+  rejectTrendConflict: parseBool(process.env.REJECT_TREND_CONFLICT, true),
   rejectRsiConflict: parseBool(process.env.REJECT_RSI_CONFLICT, true),
   rejectVolumeDeltaConflict: parseBool(process.env.REJECT_VOLUME_DELTA_CONFLICT, true),
   rejectMixedBtcRegime: parseBool(process.env.V4_REJECT_MIXED_BTC_REGIME || process.env.REJECT_MIXED_BTC_REGIME, true),
@@ -31,7 +31,7 @@ const DEFAULTS = Object.freeze({
   entryConfirmationRequired: parseBool(process.env.V4_ENTRY_CONFIRMATION_REQUIRED || process.env.ENTRY_CONFIRMATION_REQUIRED, true),
   rejectElliottConflict: parseBool(process.env.V4_REJECT_ELLIOTT_CONFLICT || process.env.REJECT_ELLIOTT_CONFLICT, true),
   elliottWaveFilterEnabled: parseBool(process.env.V4_ELLIOTT_WAVE_FILTER || process.env.ELLIOTT_WAVE_FILTER, true),
-  minSlDistancePct: parseNumber(process.env.V4_MIN_SL_DISTANCE_PCT || process.env.MIN_SL_DISTANCE_PCT, 0.15),
+  minSlDistancePct: parseNumber(process.env.V4_MIN_SL_DISTANCE_PCT || process.env.MIN_SL_DISTANCE_PCT, 0.60),
   minTurnover24h: parseNumber(process.env.MIN_TURNOVER_24H, 0),
   maxSignalAgeMinutes: parseNumber(process.env.MAX_SIGNAL_AGE_MINUTES, 5),
   v4BackendOnly: parseBool(process.env.V4_BACKEND_ONLY, true),
@@ -39,7 +39,7 @@ const DEFAULTS = Object.freeze({
   v4MinSellRR: parseNumber(process.env.V4_MIN_SELL_RR, 2.0),
   minEntryTimingScore: parseNumber(process.env.V4_MIN_ENTRY_TIMING_SCORE || process.env.MIN_ENTRY_TIMING_SCORE, 48),
   v4EntryReactionBps: parseNumber(process.env.V4_ENTRY_REACTION_BPS, 8),
-  v4EntryWaitSeconds: parseNumber(process.env.V4_ENTRY_CONFIRMATION_WINDOW_SECONDS, 300),
+  v4EntryWaitSeconds: parseNumber(process.env.V4_ENTRY_CONFIRMATION_WINDOW_SECONDS, 10),
   v4EntryToleranceAtr: parseNumber(process.env.V4_ENTRY_TOLERANCE_ATR, 0.25),
   v4WaitingExpiryMinutes: parseNumber(process.env.V4_SIGNAL_EXPIRY_MINUTES || process.env.SIGNAL_EXPIRY_MINUTES, 30),
   v4SymbolLossCooldownMinutes: parseNumber(process.env.V4_SYMBOL_COOLDOWN_MINUTES || process.env.COOLDOWN_MINUTES, 60),
@@ -92,7 +92,7 @@ function clampSettings(s) {
   out.safeMode = !!out.safeMode;
   out.oneTradePerSymbol = out.oneTradePerSymbol !== false;
   out.rejectUnknownBtcRegime = out.rejectUnknownBtcRegime === true;
-  out.rejectTrendConflict = out.rejectTrendConflict === true;
+  out.rejectTrendConflict = out.rejectTrendConflict !== false;
   out.rejectRsiConflict = out.rejectRsiConflict !== false;
   out.rejectVolumeDeltaConflict = out.rejectVolumeDeltaConflict !== false;
   out.rejectMixedBtcRegime = out.rejectMixedBtcRegime !== false;
@@ -106,7 +106,7 @@ function clampSettings(s) {
   out.v4MinSellRR = Math.max(1.2, Math.min(10, parseNumber(out.v4MinSellRR, DEFAULTS.v4MinSellRR)));
   out.minEntryTimingScore = Math.max(35, Math.min(75, parseNumber(out.minEntryTimingScore, DEFAULTS.minEntryTimingScore)));
   out.v4EntryReactionBps = Math.max(1, Math.min(15, parseNumber(out.v4EntryReactionBps, DEFAULTS.v4EntryReactionBps)));
-  out.v4EntryWaitSeconds = Math.max(5, Math.min(600, parseNumber(out.v4EntryWaitSeconds, DEFAULTS.v4EntryWaitSeconds)));
+  out.v4EntryWaitSeconds = Math.max(5, Math.min(60, parseNumber(out.v4EntryWaitSeconds, DEFAULTS.v4EntryWaitSeconds)));
   out.v4EntryToleranceAtr = Math.max(0.15, Math.min(0.50, parseNumber(out.v4EntryToleranceAtr, DEFAULTS.v4EntryToleranceAtr)));
   out.v4WaitingExpiryMinutes = Math.max(10, Math.min(60, parseNumber(out.v4WaitingExpiryMinutes, DEFAULTS.v4WaitingExpiryMinutes)));
   out.v4SymbolLossCooldownMinutes = Math.max(15, Math.min(180, parseNumber(out.v4SymbolLossCooldownMinutes, DEFAULTS.v4SymbolLossCooldownMinutes)));
