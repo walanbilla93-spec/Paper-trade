@@ -31,7 +31,7 @@ const ENTRY_TOLERANCE_MIN_PCT = Math.max(0.01, Number(process.env.V4_ENTRY_TOLER
 const ENTRY_TOLERANCE_MAX_PCT = Math.max(0.05, Number(process.env.V4_ENTRY_TOLERANCE_MAX_PCT || '0.35'));
 const ENTRY_REACTION_BPS = Math.max(1, Number(process.env.V4_ENTRY_REACTION_BPS || '8'));
 const ENTRY_REACTION_ATR = Math.max(0.02, Number(process.env.V4_ENTRY_REACTION_ATR || '0.10'));
-const ENTRY_CONFIRMATION_WINDOW_MS = Math.max(1000, Number(process.env.V4_ENTRY_CONFIRMATION_WINDOW_SECONDS || '10') * 1000);
+const ENTRY_CONFIRMATION_WINDOW_MS = Math.max(1000, Number(process.env.V4_ENTRY_CONFIRMATION_WINDOW_SECONDS || '300') * 1000);
 const MEME_SL_ATR_MULT = Math.max(0.1, Number(process.env.V4_MEME_SL_ATR_MULT || '0.45'));
 const NORMAL_SL_ATR_MULT = Math.max(0.1, Number(process.env.V4_NORMAL_SL_ATR_MULT || '0.35'));
 const EXPIRY_MS = Math.max(5, Number(process.env.V4_SIGNAL_EXPIRY_MINUTES || process.env.SIGNAL_EXPIRY_MINUTES || 45)) * 60 * 1000;
@@ -46,7 +46,7 @@ const SCORE_B = Math.max(60, Number(process.env.V4_SCORE_B || '80'));
 const MAX_SCORE_WITH_RISK = Math.max(70, Number(process.env.V4_MAX_SCORE_WITH_RISK || '82'));
 const MAX_SCORE_IF_ENTRY_FAR_ATR = Math.max(60, Number(process.env.V4_MAX_SCORE_IF_ENTRY_FAR_ATR || '78'));
 const MAX_SCORE_IF_NO_FULL_TREND = Math.max(60, Number(process.env.V4_MAX_SCORE_IF_NO_FULL_TREND || '78'));
-const MIN_SL_DISTANCE_PCT = Math.max(0, Number(process.env.V4_MIN_SL_DISTANCE_PCT || '0.60'));
+const MIN_SL_DISTANCE_PCT = Math.max(0, Number(process.env.V4_MIN_SL_DISTANCE_PCT || '0.15'));
 const REJECT_MIXED_BTC_REGIME = String(process.env.V4_REJECT_MIXED_BTC_REGIME || 'true').toLowerCase() !== 'false';
 const REJECT_MILD_EXTENSION = String(process.env.V4_REJECT_MILD_EXTENSION || 'true').toLowerCase() !== 'false';
 const REJECT_MOMENTUM_CONFLICT = String(process.env.V4_REJECT_MOMENTUM_CONFLICT || 'true').toLowerCase() !== 'false';
@@ -621,7 +621,7 @@ function buildStructurePlan(ctx, settings, btcRegime) {
     if (!support || !resistance) return { ok: false, reason: 'NO_STRUCTURE_LEVELS', leader: { symbol, score: 0, side } };
     const nearSupport = Math.abs(price - support) <= Math.max(atr * 0.75, price * 0.0075);
     entry = nearSupport ? price : Math.max(support + minBuffer * 0.35, price - atr * 0.6);
-    sl = Math.min(support - minBuffer, entry - atr * 0.55);
+    sl = Math.min(support - minBuffer, entry - atr * 0.95);
     const structureTp = resistance;
     tp1 = structureTp > entry ? structureTp : 0;
     entrySource = nearSupport ? 'current price near support' : 'pullback toward support';
@@ -631,7 +631,7 @@ function buildStructurePlan(ctx, settings, btcRegime) {
     if (!support || !resistance) return { ok: false, reason: 'NO_STRUCTURE_LEVELS', leader: { symbol, score: 0, side } };
     const nearResistance = Math.abs(price - resistance) <= Math.max(atr * 0.75, price * 0.0075);
     entry = nearResistance ? price : Math.min(resistance - minBuffer * 0.35, price + atr * 0.6);
-    sl = Math.max(resistance + minBuffer, entry + atr * 0.55);
+    sl = Math.max(resistance + minBuffer, entry + atr * 0.95);
     const structureTp = support;
     tp1 = structureTp < entry ? structureTp : 0;
     entrySource = nearResistance ? 'current price near resistance' : 'pullback toward resistance';
@@ -715,7 +715,7 @@ function minSlDistancePctFor(symbol, price, atr, settings = {}) {
   const ap = atrPct(price, atr);
   const mult = isMemeOrHighVol(symbol, price, atr) ? MEME_SL_ATR_MULT : NORMAL_SL_ATR_MULT;
   const floor = ap ? ap * mult : 0;
-  const memeFloor = isMemeOrHighVol(symbol, price, atr) ? 0.80 : 0.60;
+  const memeFloor = isMemeOrHighVol(symbol, price, atr) ? 0.20 : 0.15;
   return Math.max(base, floor, memeFloor);
 }
 
@@ -792,8 +792,8 @@ function signalEntryTiming(s, price, atr, now = Date.now(), settings = currentSe
   const reason = directional
     ? 'ENTRY_CONFIRMED: price touched zone and reacted in trade direction'
     : expiredWindow
-      ? 'WAITING_REACTION: 10s window passed without directional reaction; still waiting'
-      : 'WAITING_REACTION: price touched zone; waiting up to 10s/next ticks for direction';
+      ? 'WAITING_REACTION: 5m window passed without directional reaction; still waiting'
+      : 'WAITING_REACTION: price touched zone; waiting up to 5m/next ticks for direction';
   return { inZone, directional, tolerance, reaction, elapsed, reason };
 }
 
