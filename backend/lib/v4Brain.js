@@ -4356,7 +4356,9 @@ function signalFromLeader(leader, settings) {
   const atr = num(leader.keyLevels?.atr, Math.abs(price - entry));
   const timing = leader.entryTiming || { inZone: false, directional: false, zoneTouchScore: 0, reactionScore: 0, reason: 'WAITING_ENTRY: no entry timing context' };
   const minScore = minScoreForSide(leader.side, settings);
-  const state = timing.inZone && timing.directional ? 'PAPER_ACTIVE' : timing.inZone ? 'WAITING_REACTION' : 'WAITING_ENTRY';
+  // Planner readiness is not a fill. The shared execution-parity gate is the only
+  // path that may turn a paper signal into an active position.
+  const state = timing.inZone ? 'WAITING_REACTION' : 'WAITING_ENTRY';
   const id = `v4_${leader.symbol}_${leader.side}_${now}`;
 
   // fixMICRO2: BIRTH-TIME capture fallback. Previously coinFundingRateAtEntry/coinOpenInterestAtEntry/
@@ -4520,6 +4522,7 @@ function signalFromLeader(leader, settings) {
     experimentSettingsSnapshot: { preset: settings.experimentPresetMode || 'research', minScoreToTrade: settings.minScoreToTrade, v4MinBuyScore: settings.v4MinBuyScore, v4MinSellScore: settings.v4MinSellScore, v4AllowSells: settings.v4AllowSells, v4MinRR: settings.v4MinRR, v4MinSellRR: settings.v4MinSellRR, v4MinNetTpUsdt: settings.v4MinNetTpUsdt, v4MinNetTpFeeMult: settings.v4MinNetTpFeeMult, v4MinNetRR: settings.v4MinNetRR, v4MaxTpAtr: settings.v4MaxTpAtr, v4EntryReactionBps: settings.v4EntryReactionBps, v4EntryWaitSeconds: settings.v4EntryWaitSeconds, v4EntryToleranceAtr: settings.v4EntryToleranceAtr, btcRegimeMode: settings.btcRegimeMode, elliottWaveWeight: settings.elliottWaveWeight },
     tier: leader.tier,
     entry: plan.entry,
+    plannedEntry: plan.entry,
     sl: plan.sl,
     tp1: plan.tp1,
     rr: leader.math.rr,
@@ -5879,6 +5882,22 @@ function computeSummary(signals = getSignals()) {
 }
 
 function activeFinalFromMarket(s, market, price) {
+  if (s.executionPosition) {
+    const parity = require('./executionParity');
+    const events = (Array.isArray(market.recentCandles) ? market.recentCandles : []).map(c => ({
+      type:'CANDLE', at:num(c.ts), startAt:num(c.ts),
+      endAt:num(c.ts) + Math.max(1000, num(market.candleIntervalMs, 60000)), open:c.open, high:c.high, low:c.low,
+    }));
+    if (Number.isFinite(Number(price))) events.push({ type:'QUOTE', at:num(market.receivedAt, Date.now()), price:num(price), seq:Number.MAX_SAFE_INTEGER });
+    const out = parity.processMarketEvents(s.executionPosition, events, {
+      stopSlippageBp:Math.max(0, Number(process.env.V4_PAPER_SL_SLIP_BP ?? '3')),
+      tpSlippageBp:Math.max(0, Number(process.env.V4_PAPER_TP_SLIP_BP ?? '0')),
+      exitFeeRate:FEE_RATE,
+      funding:num(s.accruedFundingUSDT, 0),
+    });
+    if (!out) return null;
+    return { state:out.outcome, status:out.outcome === 'TP_HIT' ? 'WIN' : 'LOSS', reason:`${V4_VERSION}: ${out.outcome} from ordered post-fill event (bracket v${out.bracketVersion})`, exitPx:out.exitPrice, resolvedAtTs:out.at, rangeUsable:true, ambiguous:out.ambiguous };
+  }
   const side = String(s.side || '').toUpperCase();
   const tp = num(s.tp1), sl = num(s.sl);
   const candleTs = num(market.ts || market.candleTs || market.candle?.ts, 0);
@@ -5926,6 +5945,30 @@ function activeFinalFromMarket(s, market, price) {
   return null;
 }
 
+// Legacy active rows predate the execution ledger. Migrate once, explicitly and
+// conservatively: recorded entry/open time becomes a synthetic fill and all older
+// candles remain excluded. We never reconstruct or credit historical partial exits.
+function ensureExecutionPosition(s, now) {
+  if (s.executionPosition) return s.executionPosition;
+  const qty=num(s.qty, num(s.position)>0&&num(s.entry)>0?num(s.position)/num(s.entry):0);
+  const openedAt=num(s.openedAt,0), entry=num(s.avgFillPrice,num(s.entry));
+  if (!(qty>0&&openedAt>0&&entry>0)) {
+    s.legacyExecutionBlocked=true;
+    s.stateReason=`${V4_VERSION}: legacy active record quarantined — insufficient execution evidence`;
+    return null;
+  }
+  const parity=require('./executionParity');
+  const intent=parity.createIntent(s, openedAt, {qty,hadFirstTouch:true,requireRetest:false,orderType:'MARKET'});
+  if(intent.status!=='ACCEPTED'){s.legacyExecutionBlocked=true;return null;}
+  const pos=parity.newPosition(intent);
+  parity.acknowledgeOrder(pos,{at:openedAt,orderId:'legacy_migration'});
+  parity.applyFill(pos,{at:openedAt,price:entry,qty,fee:num(s.entryFeeUSDT,0),execId:`legacy_${s.id}`,liquidity:'LEGACY_RECORDED'});
+  pos.lastProcessedThrough=Math.max(openedAt,num(s.lastResolutionCheckTs,openedAt));
+  s.executionIntent=intent;s.executionPosition=pos;s.legacyExecutionMigratedAt=now;
+  parity.appendEvent(s,'LEGACY_POSITION_MIGRATED',now,{openedAt,entry,qty});
+  return pos;
+}
+
 // fix48d: rich per-trade diagnostic capture — pure observability, NO gating.
 // These fields are what the adaptive analysis needs and the old CSV never had:
 //   • mfeR / maeR    — max favourable / adverse excursion in R (unlocks Fix A trail/BE + partial-TP sim)
@@ -5945,10 +5988,11 @@ function btcRegimeStrength() {
 }
 
 function initActiveDiagnostics(s, entryPrice, atr, now, settings) {
-  const risk = Math.abs(num(s.entry) - num(s.sl)) || (atr || 0) || 1e-9;
+  const risk = Math.abs(num(entryPrice, num(s.entry)) - num(s.sl)) || (atr || 0) || 1e-9;
   const btc = btcRegimeStrength();
   s.diag = s.diag || {};
   s.diag.entryPx = roundPrice(entryPrice);
+  s.avgFillPrice = roundPrice(entryPrice);
   s.diag.riskAbs = risk;
   s.diag.atrAtEntry = roundPrice(atr || 0);
   s.diag.atrPctAtEntry = num(s.price) ? Number(((atr || 0) / num(s.price) * 100).toFixed(4)) : null;
@@ -6888,6 +6932,15 @@ function updateExistingSignals(signals, priceMap) {
       }
 
       if (timing.inZone && timing.directional) {
+        if (timing.missedMove) {
+          const parity = require('./executionParity');
+          s.executionIntent = parity.createIntent(s, now, { missedMove:true, hadFirstTouch:!!s.hadFirstTouch, qty:num(s.position)/num(s.entry) });
+          s.paperState = 'WAITING_ENTRY'; s.displayState = 'WAITING_ENTRY'; s.status = 'DETECTED'; s.positionStatus = 'NONE'; s.entryHit = false;
+          s.stateReason = `${V4_VERSION}: execution parity withheld missed-move order; no simulated fill`;
+          parity.appendEvent(s, 'ORDER_WITHHELD', now, { reason:s.executionIntent.reason, observedPrice:price });
+          changed = true;
+          continue;
+        }
         // fix49h(H1): ACTIVE must mean FILLED. A real GTC limit is resting at entry on Bybit —
         // the exchange decides the fill, not paper timing. Without this gate, missed-move and
         // zone-touch activation marked signals ACTIVE that Bybit never filled (paper booked
@@ -7048,6 +7101,40 @@ function updateExistingSignals(signals, priceMap) {
           }
           continue; // liveStateAuthority owns promotion to ACTIVE
         }
+        const parity = require('./executionParity');
+        const _qty = num(s.position) > 0 && num(s.entry) > 0 ? num(s.position) / num(s.entry) : num(s.qty);
+        const _activeCount = signals.filter(x => x && x.id !== s.id && x.paperState === 'PAPER_ACTIVE').length;
+        const _eligibility = decideLiveEntry(s, market, timing, settings, atr, _activeCount);
+        // decideLiveEntry is the single authority for first-touch/retest and every
+        // other normalized gate. Do not apply a second, divergent retest rule here.
+        const _intent = parity.createIntent(s, now, { missedMove:false, hadFirstTouch:!!s.hadFirstTouch, requireRetest:false, qty:_qty, eligibility:_eligibility });
+        if (_intent.status !== 'ACCEPTED') {
+          s.executionIntent = _intent; s.paperState='REJECTED'; s.displayState='REJECTED'; s.status='REJECTED'; s.positionStatus='NONE'; s.entryHit=false; s.closedAt=now;
+          parity.appendEvent(s,'ORDER_REJECTED',now,{reason:_intent.reason,observedPrice:price}); changed=true; continue;
+        }
+        const _position = s.executionPosition && ['PENDING_ACK','PENDING_FILL'].includes(s.executionPosition.status)
+          ? s.executionPosition : parity.newPosition(_intent);
+        try {
+          if (_position.status === 'PENDING_ACK') {
+            parity.acknowledgeOrder(_position, { at:now, orderId:`paper_${_intent.intentId}` });
+            s.executionIntent=_intent; s.executionPosition=_position; s.paperState='WAITING_ENTRY'; s.displayState='PAPER_PENDING_FILL';
+            s.status='DETECTED'; s.positionStatus='NONE'; s.entryHit=false;
+            parity.appendEvent(s,'PAPER_ORDER_ACK',now,{limitPrice:_intent.plannedEntry});
+            changed=true; continue;
+          }
+          const _limitTouched = _intent.side === 'BUY' ? price <= _intent.plannedEntry : price >= _intent.plannedEntry;
+          if (!_limitTouched || now <= num(_position.acknowledgedAt)) {
+            s.executionIntent=_intent; s.executionPosition=_position; s.paperState='WAITING_ENTRY'; s.displayState='PAPER_PENDING_FILL';
+            s.status='DETECTED'; s.positionStatus='NONE'; s.entryHit=false; changed=true; continue;
+          }
+          const _fillPrice = _intent.side === 'BUY' ? Math.min(price,_intent.plannedEntry) : Math.max(price,_intent.plannedEntry);
+          parity.applyFill(_position, { at:now, price:_fillPrice, qty:_qty, fee:FEE_RATE*_qty*_fillPrice, liquidity:'SIMULATED_LIMIT', execId:`paper_${_intent.intentId}_${now}` });
+        } catch (_fillErr) {
+          s.executionIntent=_intent; s.executionPosition=_position; s.paperState='REJECTED'; s.displayState='REJECTED'; s.status='REJECTED'; s.positionStatus='NONE'; s.entryHit=false; s.closedAt=now;
+          parity.appendEvent(s,'FILL_REJECTED',now,{reason:_fillErr.message,observedPrice:price}); changed=true; continue;
+        }
+        s.executionIntent = _intent;
+        s.executionPosition = _position;
         s.paperState = 'PAPER_ACTIVE';
         s.status = 'ACTIVE';
         s.displayState = 'PAPER_ACTIVE';
@@ -7058,7 +7145,7 @@ function updateExistingSignals(signals, priceMap) {
         // fix48d: initialise rich excursion/regime path tracking for adaptive analysis (no gating)
         initActiveDiagnostics(s, price, atr, now, settings);
         s.stateReason = `${V4_VERSION}: ` + timing.reason;
-        s.history = [...(s.history || []), { at: now, state: 'PAPER_ACTIVE', reason: s.stateReason, price }];
+        s.history = [...(s.history || []), { at: now, state: 'PAPER_ACTIVE', reason: s.stateReason, price, plannedEntry:s.plannedEntry, avgFillPrice:s.avgFillPrice, filledQty:_position.filledQty }];
         appendSignalDiagnostic('TRADE_ACTIVATED', s, { prevState, price, timing }, settings);
         changed = true;
         // fixORTRIGGER (4.6.9.1): FARTCOIN/AAVE/NEAR proof (07/29 chat, real ledger evidence, 3 confirmed
@@ -7148,6 +7235,8 @@ function updateExistingSignals(signals, priceMap) {
     }
 
     if (s.paperState === 'PAPER_ACTIVE') {
+      const _execPosition = ensureExecutionPosition(s, now);
+      if (!_execPosition) { changed = true; continue; }
       // fix48d: record excursion + regime path on every tick (observability only — no gating)
       trackActiveDiagnostics(s, market, price, now);
 
@@ -7177,6 +7266,7 @@ function updateExistingSignals(signals, priceMap) {
           const currentlyTighter = isBuy ? (num(s.sl) >= newSl) : (num(s.sl) <= newSl);
           if (!currentlyTighter) {
             s.sl = newSl;
+            require('./executionParity').amendBracket(_execPosition, { sl:newSl, tp:s.tp1, requestedAt:now, effectiveAt:now });
             s.regimeFlipTrail = true;
             s.regimeFlipFrom = s.regimeFlipFrom || null;
             s.regimeFlipTo = s.regimeFlipTo || null;
@@ -7210,7 +7300,10 @@ function updateExistingSignals(signals, priceMap) {
         s.positionStatus = 'CLOSED';
         s.closedAt = now;
         s.exitPx = roundPrice(price);
-        s.realizedPnl = Number((rAtExit * riskUSDT).toFixed(4));
+        require('./executionParity').closeFill(_execPosition, price, _execPosition.remainingQty, now, {
+          fee:FEE_RATE*_execPosition.remainingQty*price, funding:num(s.accruedFundingUSDT,0)
+        });
+        s.realizedPnl = Number(num(_execPosition.realizedPnl).toFixed(4));
         s.stateReason = `${V4_VERSION}: regime-flip exit ${s.regimeFlipFrom}->${s.regimeFlipTo} at ${rAtExit >= 0 ? '+' : ''}${rAtExit.toFixed(2)}R (cut before full SL)`;
         const flipDiag = { at: now, state: 'REGIME_FLIP_EXIT', reason: s.stateReason, price, exitPx: s.exitPx, rAtExit: Number(rAtExit.toFixed(3)), realizedPnl: s.realizedPnl };
         s.history = [...(s.history || []), flipDiag];
@@ -7243,7 +7336,10 @@ function updateExistingSignals(signals, priceMap) {
             s.positionStatus = 'CLOSED';
             s.closedAt = now;
             s.exitPx = roundPrice(price);
-            s.realizedPnl = Number((_rNow * _riskUSDT).toFixed(4));
+            require('./executionParity').closeFill(_execPosition, price, _execPosition.remainingQty, now, {
+              fee:FEE_RATE*_execPosition.remainingQty*price, funding:num(s.accruedFundingUSDT,0)
+            });
+            s.realizedPnl = Number(num(_execPosition.realizedPnl).toFixed(4));
             s.stateReason = `${V4_VERSION}: active reversal ${s.side}→${_revChild.side} (${_revChild.flipReason}) at ${_rNow.toFixed(2)}R — cut + reverse, retest child ${_revChild.id}`;
             const _revDiag = { at: now, state: 'ACTIVE_FLIP_EXIT', reason: s.stateReason, price, exitPx: s.exitPx, rAtExit: Number(_rNow.toFixed(3)), realizedPnl: s.realizedPnl, flip: _revChild.flipMeta };
             s.history = [...(s.history || []), _revDiag];
@@ -7292,6 +7388,11 @@ function updateExistingSignals(signals, priceMap) {
             s.netSlUSDT = Number((recomputeNetSlForMovedStop(s, newSl) * (1 - fraction)).toFixed(4));
             s.partialLockDone = true;
             s.partialLockPnl = partialPnl; // added onto whatever the remaining fraction eventually books
+            const _partialQty = _execPosition.remainingQty * fraction;
+            require('./executionParity').closeFill(_execPosition, price, _partialQty, now, {
+              fee:FEE_RATE*_partialQty*price, funding:0
+            });
+            require('./executionParity').amendBracket(_execPosition, { sl:newSl, tp:s.tp1, requestedAt:now, effectiveAt:now });
             s.stateReason = `${V4_VERSION}: PARTIAL_LOCK — banked ${(fraction*100).toFixed(0)}% (+${partialPnl}U) at +${_plRNow.toFixed(2)}R, stop moved to breakeven on the rest (sl ${oldSl}->${newSl})`;
             const lockDiag = { at: now, state: 'PARTIAL_LOCK', reason: s.stateReason, price, oldSl, newSl, rAtLock: Number(_plRNow.toFixed(3)), fraction, partialPnl };
             s.history = [...(s.history || []), lockDiag];
@@ -7359,7 +7460,9 @@ function updateExistingSignals(signals, priceMap) {
         // fixPARTIALLOCK v2: if a partial was banked earlier, add it to whatever the REMAINING
         // fraction books at final close — s.netTpUSDT/netSlUSDT were already scaled down to the
         // remaining size at the moment of the partial lock, so this is additive, not double-counted.
-        s.realizedPnl = (final.state === 'TP_HIT' ? num(s.netTpUSDT) : num(s.netSlUSDT)) + num(s.partialLockPnl, 0);
+        s.realizedPnl = s.executionPosition
+          ? Number(num(s.executionPosition.realizedPnl).toFixed(4))
+          : (final.state === 'TP_HIT' ? num(s.netTpUSDT) : num(s.netSlUSDT)) + num(s.partialLockPnl, 0);
         s.stateReason = final.reason;
         const closeDiag = { at: now, state: final.state, reason: final.reason, price, high: market.high, low: market.low, exitPx: s.exitPx, rangeUsable: final.rangeUsable, realizedPnl: s.realizedPnl, netTpUSDT: s.netTpUSDT, netSlUSDT: s.netSlUSDT, feeEstUSDT: s.feeEstUSDT };
         s.history = [...(s.history || []), closeDiag];

@@ -7,6 +7,7 @@ const { bybitPost, bybitGet } = require('./bybit');
 const { normalizeSymbol, getInstrumentInfo, getBybitPrice } = require('./instruments');
 const { toNum, roundToStep, floorToStep, ceilToStep, pctDistance } = require('./math');
 const { addLog } = require('./tradeLog');
+const { geometry, normalizeExecutionEvent, consumeExecutionEvent } = require('./executionParity');
 let qualityGate; try { qualityGate = require('./marketBrain').qualityGate; } catch(e) { qualityGate = null; }
 
 // fix44c: cache Bybit account type at startup to skip setIsolatedMarginSafe on UTA accounts
@@ -212,10 +213,15 @@ async function buildExecutionPlan(signalInput, opts = {}) {
     addLog('LEVELS_PCT_FALLBACK', `${signal.sym} ${side}: no signal SL/TP — using percentage fallback SL=${rawSl.toFixed(6)} TP=${rawTp.toFixed(6)}`);
   }
 
+  const rawGeometry = geometry(side, rawEntry, rawSl, rawTp);
+  if (!rawGeometry.ok) throw new Error(`ENTRY_GEOMETRY: ${symbol} ${rawGeometry.reason} before rounding`);
+
   // Direction-aware rounding: TP a little less greedy, SL a little conservative.
   const entry = roundToStep(rawEntry, info.tickSize);
   const tp1 = side === 'BUY' ? floorToStep(rawTp, info.tickSize) : ceilToStep(rawTp, info.tickSize);
   const sl = side === 'BUY' ? floorToStep(rawSl, info.tickSize) : ceilToStep(rawSl, info.tickSize);
+  const roundedGeometry = geometry(side, entry, sl, tp1);
+  if (!roundedGeometry.ok) throw new Error(`ENTRY_GEOMETRY: ${symbol} ${roundedGeometry.reason} after rounding`);
 
   const margin = Math.max(1, toNum(signal.margin, settings.maxTradeUsdt));
   const leverage = Math.max(1, Math.min(25, parseInt(signal.leverage || settings.leverage, 10) || settings.leverage));
@@ -775,7 +781,28 @@ async function executeSignal(signalInput, opts = {}) {
   }
 }
 
-module.exports = { executeSignal, placeLimitAtEntry, buildExecutionPlan, cleanSignal, getTrades, saveTrades, activeTrades, setTradingStopSafe, placeReduceOnlyClose, isAgreementBlocked, blockSymbolForAgreement, clearAgreementBlock, getAgreementBlocks };
+// One adapter is deliberately shared by paper fixtures and Bybit reconciliation.
+// Callers may map transport field names, but state/accounting only consumes this shape.
+function normalizeLiveFill(raw) {
+  return normalizeExecutionEvent({
+    type: raw.type || raw.execType || 'FILL',
+    execId: raw.execId || raw.exec_id,
+    orderId: raw.orderId || raw.order_id,
+    side: raw.side,
+    price: raw.execPrice ?? raw.price,
+    qty: raw.execQty ?? raw.qty,
+    fee: raw.execFee ?? raw.fee,
+    funding: raw.funding,
+    at: raw.execTime ?? raw.at ?? raw.timestamp,
+    isMaker: raw.isMaker,
+  }, 'LIVE');
+}
+function applyNormalizedExecution(position, raw, source = 'PAPER') {
+  const event = source === 'LIVE' ? normalizeLiveFill(raw) : normalizeExecutionEvent(raw, source);
+  return consumeExecutionEvent(position, event);
+}
+
+module.exports = { executeSignal, placeLimitAtEntry, buildExecutionPlan, cleanSignal, getTrades, saveTrades, activeTrades, setTradingStopSafe, placeReduceOnlyClose, isAgreementBlocked, blockSymbolForAgreement, clearAgreementBlock, getAgreementBlocks, normalizeLiveFill, applyNormalizedExecution };
 
 // fix49c: Place a GTC limit order at signal.entry the moment a signal enters WAITING_ENTRY/WAITING_REACTION.
 //
