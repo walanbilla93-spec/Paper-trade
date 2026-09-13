@@ -4873,6 +4873,30 @@ function normalizeLedgerTrade(s) {
     diag: s.diag || {}, // fix48d: rich excursion/regime path capture for adaptive analysis
     timingRevertCount: num(s.timingRevertCount, 0), // fix48d (item 4): times reverted from ENTRY_TIMING=100
     entryTiming: s.entryTiming || {},
+    // Patch 2.1 observability: preserve compact execution proof in the durable ledger.
+    // This does not participate in signal generation, eligibility, sizing, or exits.
+    plannedEntry: s.plannedEntry ?? (s.executionIntent && s.executionIntent.plannedEntry) ?? s.entry,
+    avgFillPrice: s.avgFillPrice ?? (s.executionPosition && s.executionPosition.avgFillPrice) ?? null,
+    requestedQty: (s.executionIntent && s.executionIntent.requestedQty) ?? null,
+    filledQty: (s.executionPosition && s.executionPosition.filledQty) ?? null,
+    remainingQty: (s.executionPosition && s.executionPosition.remainingQty) ?? null,
+    executionIntentId: (s.executionIntent && s.executionIntent.intentId) ?? null,
+    executionIntentStatus: (s.executionIntent && s.executionIntent.status) ?? null,
+    executionIntentAcceptedAt: (s.executionIntent && s.executionIntent.acceptedAt) ?? null,
+    executionOrderId: (s.executionPosition && Array.isArray(s.executionPosition.executionEvents)
+      ? ((s.executionPosition.executionEvents.find(e => e && e.type === 'ORDER_ACK') || {}).orderId || null) : null),
+    executionAcknowledgedAt: (s.executionPosition && s.executionPosition.acknowledgedAt) ?? null,
+    executionOpenedAt: (s.executionPosition && s.executionPosition.openedAt) ?? null,
+    entryFees: (s.executionPosition && s.executionPosition.entryFees) ?? null,
+    exitFees: (s.executionPosition && s.executionPosition.exitFees) ?? null,
+    fundingCashflow: (s.executionPosition && s.executionPosition.funding) ?? null,
+    executionStatus: (s.executionPosition && s.executionPosition.status) ?? null,
+    executionBracketVersions: (s.executionPosition && Array.isArray(s.executionPosition.bracketVersions))
+      ? s.executionPosition.bracketVersions.map(b => ({ version:b.version, sl:b.sl, tp:b.tp, requestedAt:b.requestedAt, effectiveAt:b.effectiveAt })) : [],
+    executionEvents: (s.executionPosition && Array.isArray(s.executionPosition.executionEvents))
+      ? s.executionPosition.executionEvents.map(e => ({ seq:e.seq, eventId:e.eventId, type:e.type, at:e.at, execId:e.execId || null, orderId:e.orderId || null, price:e.price ?? null, qty:e.qty ?? null, fee:e.fee ?? null, funding:e.funding ?? null })) : [],
+    timingReason: s.timingReason || '',
+    executionReason: s.executionReason || '',
     history: s.history || []
   };
 }
@@ -7135,6 +7159,7 @@ function updateExistingSignals(signals, priceMap) {
         }
         s.executionIntent = _intent;
         s.executionPosition = _position;
+        s.avgFillPrice = _position.avgFillPrice;
         s.paperState = 'PAPER_ACTIVE';
         s.status = 'ACTIVE';
         s.displayState = 'PAPER_ACTIVE';
@@ -7144,8 +7169,14 @@ function updateExistingSignals(signals, priceMap) {
         s.entryTimingScore = _activationTimingScore; // fix48d (item 5): real value, every activated trade
         // fix48d: initialise rich excursion/regime path tracking for adaptive analysis (no gating)
         initActiveDiagnostics(s, price, atr, now, settings);
+        // Patch 2.1 observability: keep signal timing commentary separate from the
+        // execution fact that actually authorized PAPER_ACTIVE. No trading behavior changes.
+        s.timingReason = `${V4_VERSION}: ` + timing.reason;
+        s.executionReason = `${V4_VERSION}: PAPER_LIMIT_FILL_CONFIRMED — accepted intent, order acknowledged, eligible limit touch, fill applied`;
+        // Preserve the legacy stateReason for UI/backward compatibility; executionReason is
+        // the authoritative execution audit field.
         s.stateReason = `${V4_VERSION}: ` + timing.reason;
-        s.history = [...(s.history || []), { at: now, state: 'PAPER_ACTIVE', reason: s.stateReason, price, plannedEntry:s.plannedEntry, avgFillPrice:s.avgFillPrice, filledQty:_position.filledQty }];
+        s.history = [...(s.history || []), { at: now, state: 'PAPER_ACTIVE', reason: s.stateReason, timingReason:s.timingReason, executionReason:s.executionReason, price, plannedEntry:s.plannedEntry, avgFillPrice:s.avgFillPrice, filledQty:_position.filledQty, intentId:_intent.intentId, acknowledgedAt:_position.acknowledgedAt }];
         appendSignalDiagnostic('TRADE_ACTIVATED', s, { prevState, price, timing }, settings);
         changed = true;
         // fixORTRIGGER (4.6.9.1): FARTCOIN/AAVE/NEAR proof (07/29 chat, real ledger evidence, 3 confirmed
