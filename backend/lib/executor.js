@@ -698,6 +698,7 @@ async function executeSignal(signalInput, opts = {}) {
   if (plan.orderType === 'Limit') body.price = String(plan.entry);
 
   addLog('PLACE_ATTEMPT', `${plan.orderType} ${plan.bybitSide} ${plan.symbol} qty ${plan.qty}`, { plan, body, note: 'TP/SL included in order request' });
+  const executionRequestedAt = Date.now();
   const data = await bybitPost('/v5/order/create', body);
   if (isDuplicateOrderLinkId(data)) {
     addLog('SKIP_DUPLICATE', `${plan.symbol}: Bybit reports orderLinkId already exists — idempotent skip (order already placed by a prior attempt)`, { orderLinkId, retMsg: data.retMsg });
@@ -748,6 +749,7 @@ async function executeSignal(signalInput, opts = {}) {
     source: opts.source || 'backend',
     signalSnapshot: signal,
   };
+  trade.liveExecutionEvidence = require('./liveExecutionObservability').orderAcknowledged(trade, body, data, executionRequestedAt);
   trades[tradeId] = trade;
   saveTrades(trades);
   addLog('PLACED', `Placed ${plan.symbol} order ${orderId}`, { trade });
@@ -917,6 +919,7 @@ async function placeLimitAtEntry(signalInput, opts = {}) {
     };
 
     addLog('WAITING_LIMIT_ATTEMPT', `GTC Limit ${bybitSide} ${signal.sym} @ ${entry} qty ${qty}`, { body, signalId: signal.id });
+    const executionRequestedAt = Date.now();
     const data = await bybitPost('/v5/order/create', body);
 
     if (isDuplicateOrderLinkId(data)) {
@@ -965,6 +968,7 @@ async function placeLimitAtEntry(signalInput, opts = {}) {
     };
 
     const trades = getTrades();
+    trade.liveExecutionEvidence = require('./liveExecutionObservability').orderAcknowledged(trade, body, data, executionRequestedAt);
     trades[tradeId] = trade;
     saveTrades(trades);
     addLog('WAITING_LIMIT_PLACED', `GTC limit placed ${signal.sym} ${side} @ ${entry}`, { tradeId, orderId, qty, sl, tp1 });

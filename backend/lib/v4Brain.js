@@ -14,6 +14,7 @@
  */
 
 const store = require('./store');
+const ledgerObservability = require('./ledgerObservability');
 const axios = require('axios');
 const { getSettings } = require('./config');
 const { addLog } = require('./tradeLog');
@@ -4831,7 +4832,7 @@ function normalizeLedgerTrade(s) {
       ? (s.lossReason || s.stateReason || lastHistoryReason(s) || 'SL hit')
       : '';
 
-  return {
+  return ledgerObservability.clone({
     id: s.id || s.signalId || key,
     key,
     planKey,
@@ -4858,8 +4859,8 @@ function normalizeLedgerTrade(s) {
     updatedAt: s.updatedAt,
     closedAt: s.closedAt || (FINAL_STATES.has(s.paperState) ? s.updatedAt : null),
     exitPx: s.exitPx || null,
-    grossTpUSDT: s.tp1ProfitUSDT || 0,
-    grossSlUSDT: s.slLossUSDT || 0,
+    grossTpUSDT: s.tp1ProfitUSDT ?? s.grossTpUSDT ?? 0,
+    grossSlUSDT: s.slLossUSDT ?? s.grossSlUSDT ?? 0,
     netTpUSDT: s.netTpUSDT || 0,
     netSlUSDT: s.netSlUSDT || 0,
     realizedPnl: num(s.realizedPnl, result === 'WIN' ? num(s.netTpUSDT) : result === 'LOSS' ? num(s.netSlUSDT) : 0),
@@ -4873,32 +4874,16 @@ function normalizeLedgerTrade(s) {
     diag: s.diag || {}, // fix48d: rich excursion/regime path capture for adaptive analysis
     timingRevertCount: num(s.timingRevertCount, 0), // fix48d (item 4): times reverted from ENTRY_TIMING=100
     entryTiming: s.entryTiming || {},
-    // Patch 2.1 observability: preserve compact execution proof in the durable ledger.
+    // Patch 2.2 observability: preserve compact execution proof in the durable ledger.
     // This does not participate in signal generation, eligibility, sizing, or exits.
-    plannedEntry: s.plannedEntry ?? (s.executionIntent && s.executionIntent.plannedEntry) ?? s.entry,
-    avgFillPrice: s.avgFillPrice ?? (s.executionPosition && s.executionPosition.avgFillPrice) ?? null,
-    requestedQty: (s.executionIntent && s.executionIntent.requestedQty) ?? null,
-    filledQty: (s.executionPosition && s.executionPosition.filledQty) ?? null,
-    remainingQty: (s.executionPosition && s.executionPosition.remainingQty) ?? null,
-    executionIntentId: (s.executionIntent && s.executionIntent.intentId) ?? null,
-    executionIntentStatus: (s.executionIntent && s.executionIntent.status) ?? null,
-    executionIntentAcceptedAt: (s.executionIntent && s.executionIntent.acceptedAt) ?? null,
-    executionOrderId: (s.executionPosition && Array.isArray(s.executionPosition.executionEvents)
-      ? ((s.executionPosition.executionEvents.find(e => e && e.type === 'ORDER_ACK') || {}).orderId || null) : null),
-    executionAcknowledgedAt: (s.executionPosition && s.executionPosition.acknowledgedAt) ?? null,
-    executionOpenedAt: (s.executionPosition && s.executionPosition.openedAt) ?? null,
-    entryFees: (s.executionPosition && s.executionPosition.entryFees) ?? null,
-    exitFees: (s.executionPosition && s.executionPosition.exitFees) ?? null,
-    fundingCashflow: (s.executionPosition && s.executionPosition.funding) ?? null,
-    executionStatus: (s.executionPosition && s.executionPosition.status) ?? null,
-    executionBracketVersions: (s.executionPosition && Array.isArray(s.executionPosition.bracketVersions))
-      ? s.executionPosition.bracketVersions.map(b => ({ version:b.version, sl:b.sl, tp:b.tp, requestedAt:b.requestedAt, effectiveAt:b.effectiveAt })) : [],
-    executionEvents: (s.executionPosition && Array.isArray(s.executionPosition.executionEvents))
-      ? s.executionPosition.executionEvents.map(e => ({ seq:e.seq, eventId:e.eventId, type:e.type, at:e.at, execId:e.execId || null, orderId:e.orderId || null, price:e.price ?? null, qty:e.qty ?? null, fee:e.fee ?? null, funding:e.funding ?? null })) : [],
-    timingReason: s.timingReason || '',
-    executionReason: s.executionReason || '',
+    ...ledgerObservability.executionProof(s),
+    partialLockDone: s.partialLockDone ?? false,
+    partialLockPnl: s.partialLockPnl ?? null,
+    tradeId: s.tradeId ?? null,
+    orderId: s.orderId ?? s.liveOrderId ?? null,
+    liveExecutionEvidence: s.liveExecutionEvidence ?? null,
     history: s.history || []
-  };
+  });
 }
 
 function lastHistoryReason(s) {
@@ -4907,79 +4892,31 @@ function lastHistoryReason(s) {
   return last && last.reason ? last.reason : '';
 }
 
-// ================================ fixLEDGERCACHE (hotfix 38, 4.6.9.12) ==========================
-// ROOT CAUSE of the reported multi-minute UI connect stalls, red/flapping SRV dot, and the growing
-// sentinel staleness (health showed sentinelHealth.ageMs=282210, ~4.7min — near the 5min blind
-// threshold). Traced, not assumed:
-//   store.read()/store.write() (lib/store.js) are fully SYNCHRONOUS — fs.readFileSync/writeFileSync
-//   + JSON.parse/stringify — and block Node's single event loop on this 0.2-vCPU box for however
-//   long the parse/stringify takes. The 'v4_paper_ledger' store is the single biggest file in the
-//   system (MAX_LEDGER=5000 rows, ~9-12KB/row per hotfix9's own measurement = tens of MB at scale)
-//   and upsertLedger() — which calls getLedger() (a full disk read+parse) then saveLedger() (a full
-//   disk write+stringify) — runs UNCONDITIONALLY at the end of EVERY scan cycle (~L7211, "Persist
-//   every signal state... before trimming the visible table"), with no gate on whether anything
-//   actually changed. That is the same disease class hotfix36 fixed for Phase 1's per-CANDIDATE
-//   read, one level worse: a full-ledger read+write on every TICK regardless of activity. It grows
-//   worse over time purely because the ledger grows toward its cap the longer the bot runs — nothing
-//   to do with hotfix37's changes, which is why it reads as "worse than before" without a matching
-//   code change on this exact day.
-//   This also directly explains the "[bybit/wallet] timeout of 10000ms exceeded" log lines: axios's
-//   timeout is a JS timer that itself needs a free event loop to fire — if a synchronous block holds
-//   the loop past the nominal 10s, the abort fires late, real elapsed time exceeds 10s, and it LOOKS
-//   like Bybit was slow when the process was actually just busy. And it explains the sentinel
-//   staleness: sentinelBrain's own separate raw read of this same file (for computeRollingWR) can be
-//   slow enough to blow the 90s watchdog, get discarded by the next scheduled tick's generation bump,
-//   and repeat — ageMs climbs even though attempts are firing every 2 minutes.
-//
-// FIX: an in-memory, write-through cache for the ledger, scoped to these two functions only.
-//   - First read in a process lifetime still hits disk once (cold-start correctness unchanged).
-//   - Every read after that is served from memory (a shallow array copy, so callers building new
-//     arrays via filter/map/spread — confirmed via grep to be the existing convention throughout
-//     this file, including reconcileOrphanedLedgerRows — can never corrupt the cache).
-//   - saveLedger still disk-writes on every call THAT ACTUALLY CHANGES something: a cheap structural
-//     signature (id|paperState|realizedPnl|closedAt per row — the only fields anything downstream
-//     depends on for correctness) is compared against the last-written signature; identical means the
-//     write is a provable no-op and is skipped; different always writes, exactly as before. This
-//     never silently drops a real trade close — a signature mismatch always writes.
-//   - Correctness note: this is a single-process, single-instance backend (Northflank one replica);
-//     no cross-process cache-invalidation problem exists here.
-// Reversible: LEDGER_CACHE_ENABLED=false restores byte-for-byte hotfix37 behaviour.
+// Single-process write-through ledger cache. Snapshots are detached from callers;
+// signatures cover the complete persisted row and advance only after disk success.
 const LEDGER_CACHE_ENABLED = true;
-let _ledgerCache = null;      // in-memory array, null until the first read/write this process
-let _ledgerCacheSig = null;   // lightweight structural signature of the last WRITTEN state
-
+const LEDGER_OBSERVABILITY_SCHEMA = ledgerObservability.SCHEMA;
+let _ledgerCache = null;
+let _ledgerCacheSig = null;
 function _ledgerRowSig(r) {
-  if (!r) return '';
-  // fixMFEALL interaction, caught in review: mfeR/maeR update every tick on an OPEN position via
-  // trackActiveDiagnostics, but paperState/realizedPnl/closedAt don't move until the trade actually
-  // resolves — a signature built from only those fields would silently defer flushing excursion data
-  // to disk until close, so a crash mid-trade could lose it. Rounding mfeR/maeR to 1 decimal (0.1R
-  // granularity — real progress, not tick noise) into the signature forces a periodic flush as an
-  // open trade's excursion genuinely moves, without reintroducing an every-tick write.
-  const mfe = r.diag ? Math.round(num(r.diag.mfeR, 0) * 10) : 0;
-  const mae = r.diag ? Math.round(num(r.diag.maeR, 0) * 10) : 0;
-  // fixPARTIALLOCK interaction, caught in review: mfeR reaching a new bucket USUALLY coincides with
-  // the tick a position first crosses +1R (partialLockDone flips true), but not guaranteed — mfeR is
-  // a max-so-far tracker, so if an earlier tick already recorded a higher peak, the bucket won't move
-  // on the exact tick the lock fires, and the sl/netSlUSDT edit alone wasn't in this signature. Same
-  // gap class as the mfeR fix above; same fix — include it explicitly rather than rely on coincidence.
-  const pl = r.partialLockDone ? 1 : 0;
-  return `${r.id || r.key || ''}|${r.paperState || r.result || ''}|${num(r.realizedPnl, 0)}|${num(r.closedAt, 0)}|${mfe}|${mae}|${pl}`;
+  return require('crypto').createHash('sha256').update(JSON.stringify(r)).digest('hex');
 }
 function _ledgerSig(rows) {
   return rows.length + ':' + rows.map(_ledgerRowSig).join(',');
 }
 
 function getLedger() {
-  if (LEDGER_CACHE_ENABLED && _ledgerCache !== null) return _ledgerCache.slice();
+  if (LEDGER_CACHE_ENABLED && _ledgerCache !== null) return ledgerObservability.clone(_ledgerCache);
   const data = store.read('v4_paper_ledger', []);
   const rows = Array.isArray(data) ? data : [];
   if (LEDGER_CACHE_ENABLED) { _ledgerCache = rows; _ledgerCacheSig = _ledgerSig(rows); }
-  return rows.slice();
+  return ledgerObservability.clone(rows);
 }
 
 function saveLedger(rows) {
   const now = Date.now();
+  const liveTrades = store.read('trades', {}) || {};
+  const liveBySignal = new Map(Object.values(liveTrades).filter(t => t && t.signalId && t.liveExecutionEvidence).map(t => [t.signalId, t]));
   const prepared = (rows || []).map(r => {
     if (!r) return r;
     const age = now - num(r.createdAt || r.openedAt || r.updatedAt, now);
@@ -5009,6 +4946,8 @@ function saveLedger(rows) {
     if ((liveState === 'WAITING_ENTRY' || liveState === 'WAITING_REACTION' || liveState === 'PAPER_ACTIVE') && !liveKeep.has(key)) continue;
     const old = unique.get(key);
     const next = normalizeLedgerTrade(r);
+    const liveTrade = liveTrades[r.tradeId] || liveBySignal.get(r.id || r.signalId);
+    if (liveTrade && liveTrade.liveExecutionEvidence) next.liveExecutionEvidence = ledgerObservability.clone(liveTrade.liveExecutionEvidence);
     if (!old || num(next.updatedAt || next.closedAt || next.createdAt) >= num(old.updatedAt || old.closedAt || old.createdAt)) {
       unique.set(key, next);
     }
@@ -5019,8 +4958,11 @@ function saveLedger(rows) {
   // (a new close, a status flip, a PnL update) changes the signature and always writes.
   if (LEDGER_CACHE_ENABLED) {
     const sig = _ledgerSig(sorted);
-    if (sig === _ledgerCacheSig) { _ledgerCache = sorted; return sorted; }
-    _ledgerCache = sorted; _ledgerCacheSig = sig;
+    if (sig === _ledgerCacheSig) return ledgerObservability.clone(_ledgerCache);
+    // Publish only after a successful durable write. Failed writes must retry.
+    store.write('v4_paper_ledger', sorted);
+    _ledgerCache = ledgerObservability.clone(sorted); _ledgerCacheSig = sig;
+    return sorted;
   }
   store.write('v4_paper_ledger', sorted);
   return sorted;
@@ -9009,9 +8951,9 @@ function clearSignals({ archive = true, clearLedger = false } = {}) {
     // ledger straight back off disk and the clear silently un-did itself.
     // Belt and braces: reset the cache AND write [] to disk directly, unconditionally.
     try {
+      store.write('v4_paper_ledger', []);
       _ledgerCache = [];
       _ledgerCacheSig = null;          // force the NEXT real write to flush too
-      store.write('v4_paper_ledger', []);
       console.warn('[v4] LEDGER CLEARED — cache reset and empty array written to disk');
     } catch (e) {
       console.error('[v4] LEDGER CLEAR FAILED:', e && e.message);
@@ -9100,7 +9042,7 @@ module.exports = {
   getKlineCacheStats: () => ({ size: _klineCache.size, cap: KLINE_CACHE_MAX }),
   MAX_LEDGER_ACTIVE: MAX_LEDGER,
   RISK_DEFAULT_ACTIVE: 0.25, // fixSIZECAP: proves the risk-per-trade default fix is loaded
-  getConfigFlags: () => ({ FIXCONFIRM_ENTRY_MARKET, fixRetestEnabled: true, restingWatchMs: RESTING_WATCH_MS }), // fixVERIFY (07/26): lets /health report the live value of entry-placement flags directly from the running process, so a deploy can be confirmed correct with zero live trades — needed because these hooks only fire when tradingEnabled=true, so logs alone can't verify a dry/warmup run.
+  getConfigFlags: () => ({ FIXCONFIRM_ENTRY_MARKET, fixRetestEnabled: true, restingWatchMs: RESTING_WATCH_MS, ledgerObservabilitySchema: LEDGER_OBSERVABILITY_SCHEMA }), // fixVERIFY (07/26): lets /health report the live value of entry-placement flags directly from the running process, so a deploy can be confirmed correct with zero live trades — needed because these hooks only fire when tradingEnabled=true, so logs alone can't verify a dry/warmup run.
   getLedgerReconcileStats, // fix49s: zombie-reconcile heartbeat — lastAt/totalReconciled for /health
   start,
   stop,
@@ -9109,6 +9051,11 @@ module.exports = {
   getSnapshot,
   getSignals,
   getLedger,
+  saveLedger,
+  upsertLedger,
+  normalizeLedgerTrade, // Patch 2.2: pure export serializer, regression-tested; no trading behavior
+  ledgerRowSignature: _ledgerRowSig, // Patch 2.2: proves execution-only changes invalidate write-skip cache
+  LEDGER_OBSERVABILITY_SCHEMA,
   computeLedgerSummary,
   clearSignals,
   computeSummary,

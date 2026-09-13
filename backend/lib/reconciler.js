@@ -103,16 +103,16 @@ function arr(data) { return data?.result?.list || []; }
 // ledger + breadth log via orderLinkId/tradeId/signalId. Lets cost-aware analysis happen from data
 // instead of screenshots. Uses data ALREADY fetched each reconcile cycle — no extra API calls.
 // TEMPORARY by design: disable via settings.bybitEventLog=false or env V4_BYBIT_EVENT_LOG_DISABLE=1.
-const _seenExecIds = new Set();
+const _seenExecIds = new Set(store.readNdjsonTail('bybit_ledger', 8000).reverse().map(e => e.execId).filter(Boolean));
 function eventLogEnabled() {
   if (String(process.env.V4_BYBIT_EVENT_LOG_DISABLE || '') === '1') return false;
   try { return getSettings().bybitEventLog !== false; } catch (_e) { return true; }
 }
 function logBybitEvent(event, fields) {
-  if (!eventLogEnabled()) return;
+  if (!eventLogEnabled()) return false;
   const now = Date.now();
-  try { store.appendNdjson('bybit_ledger', { ts: now, iso: new Date(now).toISOString(), event, ...fields }); }
-  catch (_e) { /* never let logging break the reconcile cycle */ }
+  try { store.appendNdjson('bybit_ledger', { ts: now, iso: new Date(now).toISOString(), event, ...fields }); return true; }
+  catch (e) { console.warn('[bybit-ledger] event write failed; eligible for retry:', e.message); return false; }
 }
 
 function normOrder(o) {
@@ -159,6 +159,10 @@ function normPosition(p) {
 
 function normExecution(e) {
   return {
+    execId: e.execId,
+    execType: e.execType,
+    isMaker: e.isMaker,
+    closedSize: e.closedSize,
     symbol: e.symbol,
     orderId: e.orderId,
     orderLinkId: e.orderLinkId,
@@ -517,14 +521,15 @@ async function reconcileOnce() {
       for (const e of (snapshot.executions || [])) {
         const execId = e.raw && e.raw.execId;
         if (!execId || _seenExecIds.has(execId)) continue;
-        _seenExecIds.add(execId);
-        logBybitEvent('EXECUTION', {
+        const recorded = logBybitEvent('EXECUTION', {
           symbol: e.symbol, side: e.side, orderId: e.orderId, orderLinkId: e.orderLinkId, execId,
           execPrice: e.execPrice, execQty: e.execQty, execValue: e.execValue,
           execFee: e.execFee, execPnl: e.execPnl, execTime: e.execTime,
+          execType: e.execType, isMaker: e.isMaker, closedSize: e.closedSize,
         });
+        if (recorded) _seenExecIds.add(execId);
       }
-      if (_seenExecIds.size > 5000) { const a = Array.from(_seenExecIds); _seenExecIds.clear(); a.slice(-2500).forEach(x => _seenExecIds.add(x)); }
+      if (_seenExecIds.size > 8000) { const a = Array.from(_seenExecIds); _seenExecIds.clear(); a.slice(-8000).forEach(x => _seenExecIds.add(x)); }
     }
 
     const trades = store.read('trades', {});
@@ -534,8 +539,11 @@ async function reconcileOnce() {
     await sweepOrphanBybitOrders(snapshot, trades);
 
     let changed = false;
+    let evidenceChanged = false;
     for (const [id, trade] of Object.entries(trades)) {
       if (!trade || !trade.symbol) continue;
+      // Persist late/corrected fills even after the strategy has frozen a terminal trade.
+      if (require('./liveExecutionObservability').observe(trade, snapshot)) { changed = true; evidenceChanged = true; }
       if (isTerminalTrade(trade)) continue; // fixREC1: frozen — see isTerminalTrade()
       const before = JSON.stringify(trade);
       // fix46: capture status BEFORE deriveStatus mutates trade — cancel checks need original status
@@ -720,8 +728,20 @@ async function reconcileOnce() {
       }
     }
     if (changed) store.write('trades', trades);
+    // Flush recorder-only changes even when no lifecycle status changed. Keep a
+    // failed ledger write retryable on the next cycle via the write-through cache.
+    let ledgerObservabilityError = null;
+    if (evidenceChanged || Object.values(trades).some(t => t && t.liveExecutionEvidence)) {
+      try {
+        const ledgerBrain = require('./v4Brain');
+        ledgerBrain.saveLedger(ledgerBrain.getLedger());
+      } catch (e) {
+        ledgerObservabilityError = e.message;
+        console.warn('[ledger-observability] flush failed; retry next reconcile:', e.message);
+      }
+    }
 
-    const enriched = { ...snapshot, trades, tradeList: Object.values(trades).sort((a, b) => (b.placedAt || 0) - (a.placedAt || 0)) };
+    const enriched = { ...snapshot, ledgerObservabilityError, trades, tradeList: Object.values(trades).sort((a, b) => (b.placedAt || 0) - (a.placedAt || 0)) };
     store.write('bybit-live-state', enriched);
     lastSnapshot = enriched;
     return enriched;
