@@ -9025,10 +9025,16 @@ window.switchTab = function(tab) {
     }
   }
   async function downloadSnapshot(){
-    // fixSLIM: the export's diag/planner columns are not in the slim poll — pull full rows first.
-    // On failure export proceeds with whatever is present (old behavior) rather than blocking.
-    try{ await ensureFullRows(); }catch(e){}
-    const rows=state.rows;
+    // Export the complete durable ledger, not the capped/cached dashboard window.
+    let rows;
+    try {
+      const url=backendUrl(); if(!url) throw new Error('No backend URL configured');
+      const response=await fetch(url+'/api/v4/ledger',{headers:headers(),cache:'no-store',signal:AbortSignal.timeout(90000)});
+      if(!response.ok) throw new Error('HTTP '+response.status);
+      const payload=await response.json();
+      if(!payload.ok || !Array.isArray(payload.rows)) throw new Error('Invalid ledger response');
+      rows=payload.rows;
+    } catch(e) { alert('Ledger export failed: '+e.message); return; }
     const cols=['time','symbol','side','score','entryTimingScore','entry','sl','tp1','rr','state','result','realizedPnl','source','stateReason','signalId'];
     const breakCols=['sc_base','sc_regime','sc_direction','sc_trend','sc_structure','sc_entry','sc_rr','sc_volume','sc_rsi','sc_liquidity','sc_elliottWave','sc_rawScore','sc_penalties','sc_btcRegime','sc_localRegime'];
     // fix48d: rich diagnostic columns for adaptive analysis (MFE/MAE in R, regime path, timing, durations).
@@ -9036,7 +9042,8 @@ window.switchTab = function(tab) {
     // fix48n: sentinel-context columns (captured backend-side in 48m-instr but never exported — the
     // diagCols list below ended at rsiAtEntry, so breadth/funding/composite were silently dropped).
     const diagCols=['mfeR','maeR','reachedPlus1R','reachedPlus2R','timeToActivateMin','activeDurationMin','timingRevertCount','atrPctAtEntry','btcRegimeAtEntry','btcRsiAtEntry','btcEmaSpreadAtEntry','btcAtrPctAtEntry','btcVolMomentumAtEntry','btcRegimeFlipped','btcRegimeAtExit','localRegimeAtEntry','rsiAtEntry','breadthBullPctAtEntry','breadthLabelAtEntry','fundingRateAtEntry','fundingDangerAtEntry','sentinelRegimeAtEntry','sentinelCompositeAtEntry','sentinelAllowedAtEntry','sentinelStaleAtEntry','sentinelAgeMsAtEntry','breadthOverrideAtEntry','contrarianFlipAtEntry','preFlipSide','preFlipEntry','preFlipSl','preFlipTp1','preFlipRr','preFlipScore','fearGreedAtEntry','perPairAlignAtEntry','alignScoreAtEntry','fearMultAtEntry','contextMultAtEntry'];
-    const allCols=[...cols,...breakCols,...diagCols];
+    const executionCols=['ledgerObservabilitySchema','executionEvidence','executionEvidenceGaps','plannedEntry','avgFillPrice','requestedQty','filledQty','unfilledQty','remainingQty','executionIntentId','executionIntentStatus','executionIntentAcceptedAt','executionOrderId','executionAcknowledgedAt','executionOpenedAt','entryFees','exitFees','fundingCashflow','executionStatus','executionBracketVersions','executionEvents','executionIntent','executionPosition','liveExecutionEvidence','timingReason','executionReason'];
+    const allCols=[...cols,...breakCols,...diagCols,...executionCols];
     const csv=[allCols.join(',')].concat(rows.map(r=>{
       const bd=r.diagnostic?.scoreBreakdown?.components||r.scoring?.components||r.scoreInfo?.components||{};
       const si=r.diagnostic?.scoreBreakdown||r.scoring||r.scoreInfo||{};
@@ -9084,6 +9091,7 @@ window.switchTab = function(tab) {
       return allCols.map(c=>{
         let v='';
         if(c==='time') v=rowTime(r); else if(c==='symbol') v=r.symbol||r.sym; else if(c==='state') v=stateOf(r); else if(c==='result') v=resultOf(r); else if(c==='signalId') v=idOf(r); else if(c in bv) v=bv[c]; else if(c in dv) v=dv[c]; else v=r[c];
+        if(v && typeof v==='object') v=JSON.stringify(v);
         return '"'+text(v).replace(/"/g,'""')+'"';
       }).join(',');
     })).join('\n');
