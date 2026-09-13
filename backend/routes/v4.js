@@ -70,7 +70,7 @@ function fnv1a(str) {
   return h.toString(36);
 }
 function getDashCache(snap) {
-  if (_dashCache.forTs === snap.ts && _dashCache.slimJson) return _dashCache;
+  // Snapshot timestamps can stay unchanged while ACK/fill evidence advances.
   const slim = {
     ...snap,
     slim: true, // frontend marker: heavy fields absent by design, fetch full dashboard for exports
@@ -96,12 +96,14 @@ router.get('/stats', auth, (req, res) => {
 
 router.get('/ledger', auth, (req, res) => {
   const ledger = v4.getLedger();
-  res.json({ ok: true, source: 'v4_paper_ledger', total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
 });
 
 router.get('/journal', auth, (req, res) => {
   const ledger = v4.getLedger();
-  res.json({ ok: true, source: 'v4_paper_ledger', total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
 });
 
 // fixPHASE2: real opportunity-cost check on EXPIRED signals (excludes non-crypto/TradFi symbols).
@@ -189,12 +191,14 @@ router.get('/breadth-history', auth, (req, res) => {
 // with real net P&L, fees, slippage. Download alongside the trade ledger + breadth log for
 // cost-aware analysis. Optional ?event=EXECUTION|STATUS_CHANGE filter. Read-only.
 router.get('/bybit-ledger', auth, (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || '2000', 10) || 2000, 20000);
+  const limit = Math.min(parseInt(req.query.limit || '8000', 10) || 8000, 20000);
   let rows = [];
   try { rows = store.readNdjsonTail('bybit_ledger', limit) || []; } catch (_e) {}
   const ev = req.query.event ? String(req.query.event).toUpperCase() : null;
   if (ev) rows = rows.filter(r => String(r.event || '').toUpperCase() === ev);
-  res.json({ ok: true, source: 'bybit_ledger.ndjson', total: rows.length, rows });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, source: 'bybit_ledger.ndjson', total: rows.length, requestedLimit: limit,
+    historyMayBeTruncated: true, retentionLimit: 8000, rows });
 });
 
 // fixSHADOWLOG: export routes for every shadow module in Orayan, so they can be pulled directly

@@ -133,6 +133,7 @@ router.get('/', (req, res) => {
     tradingEnabled: settings.tradingEnabled,
     keySet: keySet(),
     configFlags,     // fixVERIFY: { FIXCONFIRM_ENTRY_MARKET } — verify a code flip without a live trade
+    ledgerObservabilitySchema: configFlags && configFlags.ledgerObservabilitySchema || null,
     ledgerReconcile, // fix49s: { lastAt, totalReconciled } — zombie-sweep heartbeat
     priceSnapshot,   // fix49s: { lastUpdateAt, ageMs, updateCount, staleThresholdMs } — breadth-feed heartbeat
     sentinelHealth,  // fix49t: { updatedAt, ageMs, regime } — the exact value that froze for 20h

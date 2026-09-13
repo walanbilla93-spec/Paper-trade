@@ -111,7 +111,7 @@ function archiveAndFresh(req, res) {
       archived: rows.length,
       v4Archived: v4Rows.length,
       v4DiagnosticsArchived: Array.isArray(v4Diagnostics) ? v4Diagnostics.length : 0,
-      v4RejectionsArchived: Array.isArray(v4Rejections) ? v4Rejections.length : 0,
+      v4RejectionsArchived: 0, // rejection archive was removed; do not throw after a successful archive
       archiveId: entry.id,
       cleared: shouldClear,
       stats,
@@ -138,7 +138,7 @@ router.get('/', auth, (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || 500), 1000);
     const rows  = getJournal().slice(0, limit);
-    res.json({ ok: true, rows, total: rows.length, stats: journalStats(getJournal()) });
+    res.json({ ok: true, source: 'legacy_browser_journal', ledgerEndpoint: '/api/v4/ledger', rows, total: rows.length, stats: journalStats(getJournal()) });
   } catch (e) {
     res.json({ ok: false, error: e.message, rows: [] });
   }
