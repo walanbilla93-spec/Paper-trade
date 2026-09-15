@@ -97,7 +97,7 @@ router.get('/stats', auth, (req, res) => {
 router.get('/ledger', auth, (req, res) => {
   const ledger = v4.getLedger();
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
+  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4', rejectedOpportunityObservations:v4.getRejectedObservations(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
 });
 
 router.get('/journal', auth, (req, res) => {
