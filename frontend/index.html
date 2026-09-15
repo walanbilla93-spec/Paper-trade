@@ -7994,7 +7994,7 @@ window.switchTab = function(tab) {
 // ============================================================
 (function(){
   'use strict';
-  let VERSION='v4.6.8.49a'; // fallback only — overwritten by live snap.version in fetchV4() the moment the first poll succeeds. Fixes the stale-label bug (was hardcoded, never matched deployed backend).
+  let VERSION='4.6.9.17-PATCH-2.4.1'; // fallback only — overwritten by live snap.version in fetchV4().
   if(window.__ORAYAN_V46814_FINAL__) return;
   window.__ORAYAN_V46814_FINAL__=true;
 
@@ -9108,15 +9108,18 @@ window.switchTab = function(tab) {
     if(!url){ pushAlert('Cannot clear','Backend URL is not set — open Settings and set the backend URL first.',{key:'clear_nourl_'+Date.now(),important:true}); return false; }
     const wantLedger = opts.clearLedger === true;
     try{
-      const res = await fetch(url+(wantLedger?'/api/v4/clear-ledger':'/api/v4/clear'),{
+      const res = await fetch(url+(wantLedger?'/api/v4/clear-ledger':'/api/v4/new-session'),{
         method:'POST',headers:postHeaders(),
         body:JSON.stringify({archive:true, clearLedger:wantLedger}),
         signal:AbortSignal.timeout(12000)});
-      if(!res.ok){ pushAlert('Backend clear failed', 'HTTP '+res.status+' '+(res.statusText||''), {key:'clear_http_'+Date.now(),important:true}); return false; }
       let j={}; try{ j = await res.json(); }catch(_e){}
+      if(!res.ok || j.ok===false){
+        pushAlert('Backend clear failed', j.error || ('HTTP '+res.status+' '+(res.statusText||'')), {key:'clear_http_'+Date.now(),important:true});
+        return false;
+      }
       await fetchV4(true);
       pushAlert(wantLedger?'Ledger cleared':'Session cleared',
-        `archived=${j.archived??0} · ledger rows now ${j.ledgerTotal??'?'}${j.ledgerCleared?' · ledger wiped':' · ledger kept'}`,
+        `archived=${j.archived??0} · ledger rows now ${j.ledgerTotal??'?'}${j.ledgerCleared?' · durable ledger wiped':' · history kept'}${j.carried?` · ${j.carried} open carried`:''}`,
         {key:'clear_ok_'+Date.now()});
       return true;
     }catch(e){

@@ -21,17 +21,15 @@
     try {
       if (url) {
         const headers = typeof buildBackendHeaders === 'function' ? buildBackendHeaders() : {'Content-Type':'application/json'};
-        const resp = await fetch(url + '/api/journal/fresh', { method:'POST', headers, body: JSON.stringify({clear:true}), signal: AbortSignal.timeout(12000) });
+        const resp = await fetch(url + '/api/v4/new-session', { method:'POST', headers, body: JSON.stringify({archive:true}), signal: AbortSignal.timeout(12000) });
         const data = await resp.json().catch(()=>({}));
         if (!resp.ok || data.ok === false) throw new Error(data.error || 'Backend fresh journal failed');
       }
-      if (window.ST) { ST.journal = []; ST.signals = []; ST.v4Summary = null; }
-      try { localStorage.setItem('orayan_journal', '[]'); } catch(e) {}
+      if (window.ST) { ST.signals = []; ST.v4Summary = null; }
       try { localStorage.setItem('orayan_signals', '[]'); } catch(e) {}
-      try { localStorage.setItem('orayan_trade_events', '[]'); } catch(e) {}
       if (typeof renderJournal === 'function') renderJournal();
       if (typeof renderSignals === 'function') renderSignals();
-      alert('Fresh backend journal/session started.');
+      alert('New session started. Trade journal and rejected observations were preserved.');
     } catch(err) {
       alert('Fresh journal failed: ' + err.message);
     }
