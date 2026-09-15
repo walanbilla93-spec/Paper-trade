@@ -76,6 +76,7 @@ function archiveAndFresh(req, res) {
       ? v4.getSignals()
       : (Array.isArray(v4Snapshot?.signals) ? v4Snapshot.signals : []);
     const v4Diagnostics = v4.getDiagnostics ? v4.getDiagnostics(5000) : store.read('v4_diagnostic_journal', []);
+    const v4Observations = v4.getRejectedObservations ? v4.getRejectedObservations() : null;
     // fix44a: v4Rejections removed — skip alert system disabled
     const v4Summary = v4.computeLedgerSummary
       ? v4.computeLedgerSummary(v4Rows)
@@ -91,7 +92,8 @@ function archiveAndFresh(req, res) {
       v4Rows,
       v4Signals,
       v4Snapshot,
-      v4Diagnostics
+      v4Diagnostics,
+      v4Observations
       // fix44a: v4Rejections removed
     };
     archive.unshift(entry);
@@ -99,11 +101,8 @@ function archiveAndFresh(req, res) {
 
     const shouldClear = req.body?.clear !== false;
     if (shouldClear) {
-      saveJournal([]);
-      if (v4Brain().freshJournal) v4Brain().freshJournal();
-      store.write('v4_diagnostic_journal', []);
-      if (typeof store.clearNdjson === 'function') store.clearNdjson('v4_diagnostic_journal');
-      // fix44a: v4_candidate_rejections clear removed
+      if (v4Brain().startNewSession) v4Brain().startNewSession({archive:true,reason:'JOURNAL_FRESH'});
+      else if (v4Brain().freshJournal) v4Brain().freshJournal();
     }
 
     res.json({
@@ -114,6 +113,7 @@ function archiveAndFresh(req, res) {
       v4RejectionsArchived: 0, // rejection archive was removed; do not throw after a successful archive
       archiveId: entry.id,
       cleared: shouldClear,
+      historyPreserved: true,
       stats,
       v4Summary
     });

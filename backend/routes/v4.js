@@ -16,6 +16,7 @@ router.get('/status', auth, (req, res) => {
     ts: snap.ts,
     lastError: snap.lastError || '',
     summary: snap.summary,
+    session: v4.getSessionState(),
     btcRegime: snap.btcRegime,
     settings: getSettings()
   });
@@ -91,19 +92,19 @@ router.get('/signals', auth, (req, res) => {
 
 router.get('/stats', auth, (req, res) => {
   const ledger = v4.getLedger();
-  res.json({ ok: true, source: 'v4_paper_ledger', summary: v4.computeLedgerSummary(ledger), visible: v4.computeSummary(v4.getSignals()) });
+  res.json({ ok: true, source: 'v4_paper_ledger', summary: v4.computeLedgerSummary(ledger), sessionSummary:v4.computeSessionSummary(ledger), visible: v4.computeSummary(v4.getSignals()) });
 });
 
 router.get('/ledger', auth, (req, res) => {
   const ledger = v4.getLedger();
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4', rejectedOpportunityObservations:v4.getRejectedObservations(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
+  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4.1', rejectedOpportunityObservations:v4.getRejectedObservations(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), sessionSummary:v4.computeSessionSummary(ledger), rows: ledger });
 });
 
 router.get('/journal', auth, (req, res) => {
   const ledger = v4.getLedger();
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', total: ledger.length, summary: v4.computeLedgerSummary(ledger), rows: ledger });
+  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4.1', rejectedOpportunityObservations:v4.getRejectedObservations(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), sessionSummary:v4.computeSessionSummary(ledger), rows: ledger });
 });
 
 // fixPHASE2: real opportunity-cost check on EXPIRED signals (excludes non-crypto/TradFi symbols).
@@ -322,11 +323,18 @@ router.post('/scan', auth, async (req, res) => {
 });
 
 router.post('/clear', auth, (req, res) => {
-  res.json(v4.clearSignals({ archive: req.body?.archive !== false, clearLedger: req.body?.clearLedger === true }));
+  try { res.json(v4.startNewSession({ archive: req.body?.archive !== false, reason:'API_NEW_SESSION' })); }
+  catch(e){ res.status(500).json({ok:false,error:e.message}); }
 });
 
 router.post('/clear-ledger', auth, (req, res) => {
-  res.json(v4.clearSignals({ archive: req.body?.archive !== false, clearLedger: true }));
+  try { res.json(v4.clearSignals({ archive: req.body?.archive !== false, clearLedger: true })); }
+  catch(e){ res.status(e.code==='LEDGER_CLEAR_BLOCKED'?409:500).json({ok:false,error:e.message,unresolved:e.unresolved||[]}); }
+});
+
+router.post('/new-session', auth, (req, res) => {
+  try { res.json(v4.startNewSession({ archive: req.body?.archive !== false, reason:'API_NEW_SESSION' })); }
+  catch(e){ res.status(500).json({ok:false,error:e.message}); }
 });
 
 router.post('/cancel-signal', auth, (req, res) => {
@@ -407,7 +415,7 @@ router.post('/safe-mode', auth, (req, res) => {
 router.get('/pnl', auth, (req, res) => {
   const perm = v4.getPermanentSummary(7);
   const ledger = v4.getLedger();
-  const currentSummary = v4.computeLedgerSummary(ledger);
+  const currentSummary = v4.computeSessionSummary(ledger);
   res.json({
     ok: true,
     source: 'v4_pnl_permanent',
