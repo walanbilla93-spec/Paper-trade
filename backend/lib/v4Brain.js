@@ -14,6 +14,39 @@
  */
 
 const store = require('./store');
+const marketPolicy = require('./marketPermission');
+const paperOrders = require('./paperOrderLifecycle');
+const observations = require('./rejectedObservations');
+const patch24Identity = require('./patch24Identity');
+function observeDecision24(s,type,reason,at=Date.now(),market={}) {
+  const settings=currentSettings();
+  return observations.register({...s,observationContext:{patchVersion:patch24Identity.patchVersion,
+    sourceHash:patch24Identity.sourceHash,configHash:patch24Identity.configHash(settings),
+    scorePolicy:{minInclusive:40,maxExclusive:80},timingThreshold:Number(process.env.V4_TIMING_BLOCK_THRESHOLD||44),
+    marketPermission:s.marketPermission||currentMarketPermission(at)}},type,reason,at,market);
+}
+function currentMarketPermission(now = Date.now()) {
+  const capture = getSentinelForCapture();
+  let live=null;try{live=sentinel.getSentinel();}catch(_e){}
+  const options={now,
+    buyMin:Math.max(0,Math.min(50,Number(process.env.V4_BUY_MIN_BREADTH || '50'))),
+    sellMax:Math.max(50,Math.min(100,Number(process.env.V4_SELL_MAX_BREADTH || '50')))};
+  const current=marketPolicy.resolve({...options,sent:live});
+  // A valid breadth reading has authority even when the composite/BTC label is UNKNOWN.
+  return current.usable?current:marketPolicy.resolve({...options,sent:capture.sent});
+}
+function reconcileScoreAdmission(leader, gate) {
+  const reasons = (leader.rejectReasons || gate.reasons || []).filter(r=>!/^SCORE_(BAND|LT)_/.test(String(r)));
+  const pass = passesScoreBand(leader.score);
+  if (!pass) reasons.push('SCORE_BAND_OUT_' + leader.score);
+  leader.scoreAdmission={raw:leader.euphGuard?.from ?? leader.bottomGuard?.from ?? leader.score,
+    adjusted:leader.euphAdxPromote?.from ?? leader.euphGuard?.to ?? leader.score,
+    final:leader.score,policy:{enabled:SCORE_BAND_ENABLED,minInclusive:SCORE_BAND_LO,maxExclusive:SCORE_BAND_HI},pass};
+  leader.rejectReasons=reasons;leader.rejected=reasons.length>0;
+  gate.reasons=reasons;gate.ok=!leader.rejected;gate.scoreAdmission=leader.scoreAdmission;
+  return gate;
+}
+
 const ledgerObservability = require('./ledgerObservability');
 const axios = require('axios');
 const { getSettings } = require('./config');
@@ -164,7 +197,7 @@ const PUBLIC_BASE = process.env.V4_MARKET_BASE_URL || 'https://api.bybit.com';
 // understand that a zero-cost simulation cannot tell you whether a strategy is tradeable.
 const FEE_RATE = Math.max(0, Number(process.env.V4_FEE_RATE ?? '0.000375'));      // per side; 0.075% round trip
 const SLIPPAGE_RATE = Math.max(0, Number(process.env.V4_SLIPPAGE_RATE ?? '0.0002')); // per side; 2bp
-const V4_VERSION = '4.6.9.16'; // NEW in .16 — hotfix42, fixPARTIALCLOSE. User's direct, correct pushback on .15: 'sometimes it reaches breakeven & then moves to TP. If we do not book any profit, that has no point. I will be left with nothing.' Breakeven-only never banks a gain — it only stops the worst case. Built the real partial close, deferred in .15 out of caution about untested live order-placement code; on reflection that caution was overstated — this codebase already places real orders successfully every trade tonight, and a reduce-only partial close is the SAME bybitPost('/v5/order/create') call with an inverted side, a fractional qty, and reduceOnly:true, not new API surface. New executor.js function placeReduceOnlyClose() mirrors executeSignal()'s exact structure (same getInstrumentInfo/floorToStep qty rounding already proven on every entry tonight, same duplicate-orderLinkId and rejection handling). SHIPPED: at +1R (V4_PARTIAL_LOCK_TRIGGER_R), banks V4_PARTIAL_LOCK_FRACTION (default 50%, clamped 10-90%) of the position at the ACTUAL price reached (not an idealized exact 1.0R — an overshoot to 1.4R banks 1.4R on the closed fraction), moves the stop to breakeven on the remainder — paper always, live for real via placeReduceOnlyClose when s.tradeId exists. The remaining fraction's netTpUSDT/netSlUSDT are scaled down to match the smaller position so a full-size number is never booked against a partial-size position; final realizedPnl is additive (banked partial + whatever the remaining fraction eventually books at TP or breakeven-SL). Live partial-close failure and the stop-move are INDEPENDENT outcomes on purpose — if the close order is rejected or the live qty can't be found, the breakeven stop move still fires, so the live position is never less protected than .15's behaviour even on a partial failure; failure is surfaced via s.partialCloseLiveFailed + a WARN log, never silent (the exact class of thing tonight's session spent hours hunting down elsewhere). 19/19 new unit tests across two harnesses (paper accounting: exact-trigger banking, real-overshoot banking not idealized-1.0R, both sides, below-trigger no-op, additive final combination both TP and breakeven-SL outcomes, fraction clamp bounds; live order construction: side inversion both directions — the single most safety-critical line in the feature — qty rounding against tonight's own real AIOUSDT/DEXEUSDT lot sizes, below-exchange-minimum fails closed rather than sending an invalid order). Full regression: 112/112 across all 10 suites from tonight's session (hotfixes 37-42 stacked in one file, nothing broken). node --check clean on 4 files. NOT yet deployed. Prior .15 — hotfix41, fixPARTIALLOCK v1 (breakeven-lock only). User witnessed the same shape 4 times TONIGHT on real money: a position reaches ~1R favorable then reverses through the bot's own unprotected stop before TP/SL fires. Quantified from tonight's 8 real Bybit closes via fixMFEALL's mfeR capture: ALL 8 reached positive mfeR (0.39R-2.66R) — entry timing ruled OUT with data, not assumed; of the 4 'wins', 3 (ERA/COTI/AIO) were only wins because the user manually intervened, so the bot's own unaided tally tonight was 1W/7L. SHIPPED: once an open position reaches +1R (V4_PARTIAL_LOCK_TRIGGER_R, default 1.0), the stop moves to exact breakeven — both paper and live (reuses fix48i-TRAIL's already-proven-live executor.setTradingStopSafe call verbatim, not new untested mechanics), only ever tightens, fires once per position. DELIBERATELY DESCOPED for tonight: does NOT yet physically bank partial size on Bybit — that needs a brand-new reduce-only live order call this codebase has never used before, and writing it untested against the real API at the end of an already-long live-money session was judged a worse risk than shipping breakeven-only now and building partial-size banking as a separately-tested follow-up. Breakeven alone already eliminates the exact failure witnessed 4 times (worst case ~$0, not a full R loss). TWO REAL BUGS FOUND AND FIXED IN REVIEW, not hypothetical: (1) netSlUSDT is computed ONCE at signal birth and never recalculated — moving the stop without fixing this would have silently booked the STALE original-distance loss instead of ~$0 on a breakeven stop-out, meaning the whole feature would have appeared to work in the logs while doing nothing to the P&L; added recomputeNetSlForMovedStop() mirroring calculatePaperMath's own formula. Same latent gap flagged (not fixed, scope discipline) in the pre-existing fix48i-TRAIL, which has the identical issue. (2) hotfix38's ledger write-skip signature didn't cover partialLockDone — caught the exact edge case where mfeR already peaked on an earlier tick, so the lock event alone wouldn't have forced a disk flush, risking the breakeven protection being lost on a crash+restart before the position resolved; added partialLockDone to the signature. 20/20 new unit tests across two harnesses (R-calc both sides + boundary, breakeven price both sides, only-tighten guard both directions, netSl recompute incl. fail-open on missing entry/position, the exact ledger-signature gap reproduced and fixed). Full regression: 93/93 across all 8 suites from tonight's session (37/38/39/40/41 stacked in one file, nothing broken). node --check clean on both files. NOT yet deployed. Prior .14 — hotfix40, fixPCTBANDSHADOW. User asked directly whether the fixPCT continuation/breakout-entry system (coinTrendEngine, live since .85-.88, still fully active: PCT_ENABLED/PCT_VOTE_ENABLED/PCT_PULLBACK_ENABLED all true) could be 'integrated' — it already is, running under everything shipped tonight. Checking the interaction surfaced something owed a clearer flag than the code comment it got in .11: fork-A's score-gate bypass (PCT_SCORE_BYPASS) matches SCORE_LT_* and has been SILENTLY DEAD since fixBAND replaced that whole reason system with SCORE_BAND_* — a strong continuation-entry leader currently gets no rescue from a band-only rejection, and nobody decided that on purpose, it was a side effect. User's call: build evidence-gathering now, decide the actual fix later. fixPCTBANDSHADOW mirrors the existing breadthFightShadow pattern exactly (same file, same author, same shape) — record-only, leader.rejected/gate.ok/rejectReasons never touched. Stamps leader.pctBandShadow (entry/sl/tp1/rr/score/coin-trend context) only when SCORE_BAND_* is the LAST barrier (mirrors fork-A's own 'only when score is the sole blocker' rule, so the eventual decision is judged on exactly the cases fork-A itself would ever be able to rescue). New PCT_SCAN counter pctBandBlocked=N, new addLog('PCT_BAND_SHADOW', ...) throttled through hotfix39's shouldLogGuard (same repeat-condition-on-same-symbol shape that caused tonight's earlier log spam), added to PHASE_LOG_TYPES so it's durable from day one. 9/9 unit tests (sole-blocker fires, band+regime-only still fires per fork-A's own rule, band+real-other-gate does NOT fire, wrong/missing continuationEntry never a candidate, withSide=false suppresses, admitted leader never fires, reason-string extraction, and a purity check proving the eval never mutates its input — matching breadthFightShadow's record-only contract). Full regression: 73/73 across 6 suites (hotfix37/38/39/40 all still green together). node --check clean on 3 files. NOT yet deployed. Prior .13 — hotfix39, fixGUARDLOG. User caught it directly from Northflank logs: BOTTOM_GUARD and PERCOIN_CONFLICT logged a fresh identical line for the SAME coin every scan tick (~20-40s) for HOURS while the condition never changed — EULUSDT/AEHRUSDT showed dozens of stacked near-duplicate lines. Found EUPH_GUARD sharing the exact same shape in the same review pass and fixed it too. IMPORTANT: only the LOG LINE is throttled — the underlying score dampening/rejection still runs and re-evaluates every tick exactly as before, so a coin's status still reacts instantly; only the disk-write/log-noise is capped, via a TIME-based per-symbol-per-guard-type cooldown (V4_GUARD_LOG_COOLDOWN_MS, default 5min) rather than a permanent once-ever suppress, since these conditions genuinely change over hours and a real re-entry deserves a fresh line. 9/9 unit tests (independent per-symbol, independent per-guard-type on the same symbol, cooldown boundary, re-entry after cooldown is NOT permanently silenced, size-cap safety valve). node --check clean. Prior .12 — hotfix38, fixLEDGERCACHE. ROOT-CAUSED the reported multi-minute UI connect stalls / red-flapping SRV / apparent Bybit wallet timeouts / growing sentinel staleness. store.read/write (lib/store.js) are fully synchronous (fs.readFileSync/writeFileSync + JSON.parse/stringify) and block Node's single event loop; upsertLedger() — a full read+merge+write of the biggest store in the system (MAX_LEDGER=5000 rows, ~9-12KB/row per hotfix9 = tens of MB at scale) — ran UNCONDITIONALLY at the end of EVERY scan cycle with no changed-gate, same disease class hotfix36 fixed for a per-candidate read, one level worse (full-ledger, every tick). Explains the wallet timeout log lines too: axios's abort timer needs a free event loop to fire, so a long sync block makes a call LOOK late even when Bybit itself wasn't. Fix: in-memory write-through cache scoped to getLedger/saveLedger only — first read/process-lifetime hits disk once, every read after is a shallow array copy from memory (verified via grep that ledger rows are only ever replaced via spread, never mutated in place, so sharing row references across cache reads is safe), writes skip disk when a structural signature (id|paperState|realizedPnl|closedAt, plus mfeR/maeR bucketed to 0.1R so fixMFEALL's excursion data still flushes periodically on an open trade rather than only at close — caught in my own review's unit tests) is unchanged from the last write; any real change always writes. sentinelBrain's separate raw read of the same file (its own staleness source) now routes through this same cache via a lazy require (avoids the circular-require v4Brain<->sentinelBrain would otherwise hit). Reversible: LEDGER_CACHE_ENABLED=false. 17/17 unit tests across two harnesses (cold-start disk hit, cache-served reads, no-op write skip, real-change write, external-mutation isolation, the mfeR/maeR durability tradeoff I caught and fixed in review, reversibility). NOT yet deployed. Prior .11 — hotfix37, three fixes in one drop. (a) fixBAND: the score QUALITY BAND 40-80 replaces hotfix33's RSI zone as the sole candidate admission rule at all 3 enforcement points; score measured by BUCKET (not linear correlation) on 167 resolved signals reads <40=27%WR n=41, 40-80=60%WR n=119, 80+=0%WR n=7 — U-shaped, which is exactly how a real signal reads as r~0 under the old linear test that produced the 'score is dead weight' rule. Validated leave-one-day-out (band wins 6/6 days) and by within-day stratified permutation (36.7pp gap, p=0.0032), with a flat plateau across floors 35-45 and ceilings 75-85 so it is not a fitted knife-edge. Replay on the 07/30-31 bleed window: -2.02U over 33 trades becomes +0.05U over 8. RSI is NOT deleted — demoted to a shadow stamp (rsiGateShadow / rsiGateShadowAtBirth) so it keeps gathering evidence. fork-A's blanket score waiver is deliberately left dormant (it would re-open the hole); fixEUPHADX's promote is rewired to the new reason string and now re-tests the restored score against the band. (b) fixARM: restingOrderWatch re-runs fixKNIFEGUARD's own candle test against an ALREADY-RESTING limit every 10s and cancels through the existing flagTradeForCancel/STALE_CANCELLED path — placement checked momentum once, the order was then exposed unchecked until fill. [Likely, NOT proven: supporting split is fills <30s 50%WR vs 30s+ 76%WR on n=65, within-day permutation p=0.19; judged by the caged session.] Does not re-arm, by design. (c) fixMFEALL: excursion capture (mfeR/maeR) only ever ran on the paper path — both live seams skipped it, so only 65 of 167 resolved rows carried it and the missing ones were the real-money trades. Pure observability, no gate reads it. Prior .10 — hotfix36 (URGENT, real regression): user reported
+const V4_VERSION = '4.6.9.16-PATCH-2.4'; // NEW in .16 — hotfix42, fixPARTIALCLOSE. User's direct, correct pushback on .15: 'sometimes it reaches breakeven & then moves to TP. If we do not book any profit, that has no point. I will be left with nothing.' Breakeven-only never banks a gain — it only stops the worst case. Built the real partial close, deferred in .15 out of caution about untested live order-placement code; on reflection that caution was overstated — this codebase already places real orders successfully every trade tonight, and a reduce-only partial close is the SAME bybitPost('/v5/order/create') call with an inverted side, a fractional qty, and reduceOnly:true, not new API surface. New executor.js function placeReduceOnlyClose() mirrors executeSignal()'s exact structure (same getInstrumentInfo/floorToStep qty rounding already proven on every entry tonight, same duplicate-orderLinkId and rejection handling). SHIPPED: at +1R (V4_PARTIAL_LOCK_TRIGGER_R), banks V4_PARTIAL_LOCK_FRACTION (default 50%, clamped 10-90%) of the position at the ACTUAL price reached (not an idealized exact 1.0R — an overshoot to 1.4R banks 1.4R on the closed fraction), moves the stop to breakeven on the remainder — paper always, live for real via placeReduceOnlyClose when s.tradeId exists. The remaining fraction's netTpUSDT/netSlUSDT are scaled down to match the smaller position so a full-size number is never booked against a partial-size position; final realizedPnl is additive (banked partial + whatever the remaining fraction eventually books at TP or breakeven-SL). Live partial-close failure and the stop-move are INDEPENDENT outcomes on purpose — if the close order is rejected or the live qty can't be found, the breakeven stop move still fires, so the live position is never less protected than .15's behaviour even on a partial failure; failure is surfaced via s.partialCloseLiveFailed + a WARN log, never silent (the exact class of thing tonight's session spent hours hunting down elsewhere). 19/19 new unit tests across two harnesses (paper accounting: exact-trigger banking, real-overshoot banking not idealized-1.0R, both sides, below-trigger no-op, additive final combination both TP and breakeven-SL outcomes, fraction clamp bounds; live order construction: side inversion both directions — the single most safety-critical line in the feature — qty rounding against tonight's own real AIOUSDT/DEXEUSDT lot sizes, below-exchange-minimum fails closed rather than sending an invalid order). Full regression: 112/112 across all 10 suites from tonight's session (hotfixes 37-42 stacked in one file, nothing broken). node --check clean on 4 files. NOT yet deployed. Prior .15 — hotfix41, fixPARTIALLOCK v1 (breakeven-lock only). User witnessed the same shape 4 times TONIGHT on real money: a position reaches ~1R favorable then reverses through the bot's own unprotected stop before TP/SL fires. Quantified from tonight's 8 real Bybit closes via fixMFEALL's mfeR capture: ALL 8 reached positive mfeR (0.39R-2.66R) — entry timing ruled OUT with data, not assumed; of the 4 'wins', 3 (ERA/COTI/AIO) were only wins because the user manually intervened, so the bot's own unaided tally tonight was 1W/7L. SHIPPED: once an open position reaches +1R (V4_PARTIAL_LOCK_TRIGGER_R, default 1.0), the stop moves to exact breakeven — both paper and live (reuses fix48i-TRAIL's already-proven-live executor.setTradingStopSafe call verbatim, not new untested mechanics), only ever tightens, fires once per position. DELIBERATELY DESCOPED for tonight: does NOT yet physically bank partial size on Bybit — that needs a brand-new reduce-only live order call this codebase has never used before, and writing it untested against the real API at the end of an already-long live-money session was judged a worse risk than shipping breakeven-only now and building partial-size banking as a separately-tested follow-up. Breakeven alone already eliminates the exact failure witnessed 4 times (worst case ~$0, not a full R loss). TWO REAL BUGS FOUND AND FIXED IN REVIEW, not hypothetical: (1) netSlUSDT is computed ONCE at signal birth and never recalculated — moving the stop without fixing this would have silently booked the STALE original-distance loss instead of ~$0 on a breakeven stop-out, meaning the whole feature would have appeared to work in the logs while doing nothing to the P&L; added recomputeNetSlForMovedStop() mirroring calculatePaperMath's own formula. Same latent gap flagged (not fixed, scope discipline) in the pre-existing fix48i-TRAIL, which has the identical issue. (2) hotfix38's ledger write-skip signature didn't cover partialLockDone — caught the exact edge case where mfeR already peaked on an earlier tick, so the lock event alone wouldn't have forced a disk flush, risking the breakeven protection being lost on a crash+restart before the position resolved; added partialLockDone to the signature. 20/20 new unit tests across two harnesses (R-calc both sides + boundary, breakeven price both sides, only-tighten guard both directions, netSl recompute incl. fail-open on missing entry/position, the exact ledger-signature gap reproduced and fixed). Full regression: 93/93 across all 8 suites from tonight's session (37/38/39/40/41 stacked in one file, nothing broken). node --check clean on both files. NOT yet deployed. Prior .14 — hotfix40, fixPCTBANDSHADOW. User asked directly whether the fixPCT continuation/breakout-entry system (coinTrendEngine, live since .85-.88, still fully active: PCT_ENABLED/PCT_VOTE_ENABLED/PCT_PULLBACK_ENABLED all true) could be 'integrated' — it already is, running under everything shipped tonight. Checking the interaction surfaced something owed a clearer flag than the code comment it got in .11: fork-A's score-gate bypass (PCT_SCORE_BYPASS) matches SCORE_LT_* and has been SILENTLY DEAD since fixBAND replaced that whole reason system with SCORE_BAND_* — a strong continuation-entry leader currently gets no rescue from a band-only rejection, and nobody decided that on purpose, it was a side effect. User's call: build evidence-gathering now, decide the actual fix later. fixPCTBANDSHADOW mirrors the existing breadthFightShadow pattern exactly (same file, same author, same shape) — record-only, leader.rejected/gate.ok/rejectReasons never touched. Stamps leader.pctBandShadow (entry/sl/tp1/rr/score/coin-trend context) only when SCORE_BAND_* is the LAST barrier (mirrors fork-A's own 'only when score is the sole blocker' rule, so the eventual decision is judged on exactly the cases fork-A itself would ever be able to rescue). New PCT_SCAN counter pctBandBlocked=N, new addLog('PCT_BAND_SHADOW', ...) throttled through hotfix39's shouldLogGuard (same repeat-condition-on-same-symbol shape that caused tonight's earlier log spam), added to PHASE_LOG_TYPES so it's durable from day one. 9/9 unit tests (sole-blocker fires, band+regime-only still fires per fork-A's own rule, band+real-other-gate does NOT fire, wrong/missing continuationEntry never a candidate, withSide=false suppresses, admitted leader never fires, reason-string extraction, and a purity check proving the eval never mutates its input — matching breadthFightShadow's record-only contract). Full regression: 73/73 across 6 suites (hotfix37/38/39/40 all still green together). node --check clean on 3 files. NOT yet deployed. Prior .13 — hotfix39, fixGUARDLOG. User caught it directly from Northflank logs: BOTTOM_GUARD and PERCOIN_CONFLICT logged a fresh identical line for the SAME coin every scan tick (~20-40s) for HOURS while the condition never changed — EULUSDT/AEHRUSDT showed dozens of stacked near-duplicate lines. Found EUPH_GUARD sharing the exact same shape in the same review pass and fixed it too. IMPORTANT: only the LOG LINE is throttled — the underlying score dampening/rejection still runs and re-evaluates every tick exactly as before, so a coin's status still reacts instantly; only the disk-write/log-noise is capped, via a TIME-based per-symbol-per-guard-type cooldown (V4_GUARD_LOG_COOLDOWN_MS, default 5min) rather than a permanent once-ever suppress, since these conditions genuinely change over hours and a real re-entry deserves a fresh line. 9/9 unit tests (independent per-symbol, independent per-guard-type on the same symbol, cooldown boundary, re-entry after cooldown is NOT permanently silenced, size-cap safety valve). node --check clean. Prior .12 — hotfix38, fixLEDGERCACHE. ROOT-CAUSED the reported multi-minute UI connect stalls / red-flapping SRV / apparent Bybit wallet timeouts / growing sentinel staleness. store.read/write (lib/store.js) are fully synchronous (fs.readFileSync/writeFileSync + JSON.parse/stringify) and block Node's single event loop; upsertLedger() — a full read+merge+write of the biggest store in the system (MAX_LEDGER=5000 rows, ~9-12KB/row per hotfix9 = tens of MB at scale) — ran UNCONDITIONALLY at the end of EVERY scan cycle with no changed-gate, same disease class hotfix36 fixed for a per-candidate read, one level worse (full-ledger, every tick). Explains the wallet timeout log lines too: axios's abort timer needs a free event loop to fire, so a long sync block makes a call LOOK late even when Bybit itself wasn't. Fix: in-memory write-through cache scoped to getLedger/saveLedger only — first read/process-lifetime hits disk once, every read after is a shallow array copy from memory (verified via grep that ledger rows are only ever replaced via spread, never mutated in place, so sharing row references across cache reads is safe), writes skip disk when a structural signature (id|paperState|realizedPnl|closedAt, plus mfeR/maeR bucketed to 0.1R so fixMFEALL's excursion data still flushes periodically on an open trade rather than only at close — caught in my own review's unit tests) is unchanged from the last write; any real change always writes. sentinelBrain's separate raw read of the same file (its own staleness source) now routes through this same cache via a lazy require (avoids the circular-require v4Brain<->sentinelBrain would otherwise hit). Reversible: LEDGER_CACHE_ENABLED=false. 17/17 unit tests across two harnesses (cold-start disk hit, cache-served reads, no-op write skip, real-change write, external-mutation isolation, the mfeR/maeR durability tradeoff I caught and fixed in review, reversibility). NOT yet deployed. Prior .11 — hotfix37, three fixes in one drop. (a) fixBAND: the score QUALITY BAND 40-80 replaces hotfix33's RSI zone as the sole candidate admission rule at all 3 enforcement points; score measured by BUCKET (not linear correlation) on 167 resolved signals reads <40=27%WR n=41, 40-80=60%WR n=119, 80+=0%WR n=7 — U-shaped, which is exactly how a real signal reads as r~0 under the old linear test that produced the 'score is dead weight' rule. Validated leave-one-day-out (band wins 6/6 days) and by within-day stratified permutation (36.7pp gap, p=0.0032), with a flat plateau across floors 35-45 and ceilings 75-85 so it is not a fitted knife-edge. Replay on the 07/30-31 bleed window: -2.02U over 33 trades becomes +0.05U over 8. RSI is NOT deleted — demoted to a shadow stamp (rsiGateShadow / rsiGateShadowAtBirth) so it keeps gathering evidence. fork-A's blanket score waiver is deliberately left dormant (it would re-open the hole); fixEUPHADX's promote is rewired to the new reason string and now re-tests the restored score against the band. (b) fixARM: restingOrderWatch re-runs fixKNIFEGUARD's own candle test against an ALREADY-RESTING limit every 10s and cancels through the existing flagTradeForCancel/STALE_CANCELLED path — placement checked momentum once, the order was then exposed unchecked until fill. [Likely, NOT proven: supporting split is fills <30s 50%WR vs 30s+ 76%WR on n=65, within-day permutation p=0.19; judged by the caged session.] Does not re-arm, by design. (c) fixMFEALL: excursion capture (mfeR/maeR) only ever ran on the paper path — both live seams skipped it, so only 65 of 167 resolved rows carried it and the missing ones were the real-money trades. Pure observability, no gate reads it. Prior .10 — hotfix36 (URGENT, real regression): user reported
 // backend timeouts severe enough to force a manual pause — gradual onset, backend-only, frontend
 // fine, tracked the recent v4Brain hotfixes. Traced to Phase 1 (hotfix29): decideLiveEntry() called
 // activeTrades() -> getTrades() -> store.read('trades', {}) on EVERY qualifying candidate, EVERY
@@ -888,6 +921,8 @@ async function applyPerCoinTrend(leader, gate) {
     } catch (_l) {}
   }
 
+  reconcileScoreAdmission(leader, gate);
+
   // fixPCT SHADOW: record the would-be trade for a breadth-fight-blocked strong pullback leader.
   // RECORD ONLY — no mutation of leader.rejected / gate.ok / rejectReasons happens in this block.
   if (breadthFightBlocked && withSide) {
@@ -1347,6 +1382,7 @@ async function fetchTickers() {
     .filter(x => x.symbol && x.symbol.endsWith('USDT') && num(x.lastPrice) > 0)
     .map(x => ({
       symbol: x.symbol,
+      sourceAt: Number(data.time) || null, receivedAt:Date.now(), priceSource:'BYBIT_REST_TICKER',
       lastPrice: num(x.lastPrice),
       markPrice: num(x.markPrice),
       price: num(x.lastPrice), // fix33-obs8b: sentinelBrain filters p.price (not p.lastPrice) — alias needed for breadth
@@ -2266,7 +2302,7 @@ function convictionScore(ctx, decision, plan, math, btcRegime, levels) {
 
   const localRegimeData = detectLocalRegime(k5, Array.isArray(ctx.k15) ? ctx.k15 : []);
   const localRegime = localRegimeData.localRegime;
-  const sideAllowance = getAllowedSides(btcRegime.regime, localRegime);
+  const sideAllowance = currentMarketPermission();
 
   const components = {};
   const confluence = [];
@@ -2295,125 +2331,13 @@ function convictionScore(ctx, decision, plan, math, btcRegime, levels) {
   else if (entryDistanceAtr >= 0.5 && entryDistanceAtr <= 1.0) confluence.push('entry in zone-touch sweet spot');
   else if (entryDistanceAtr > 1.8) risks.push('entry stretched from current price');
 
-  // ── FACTOR 3: Regime alignment scaled by STRENGTH (0.35 .. 1.20) ──────────
-  // Continuous, not a flat per-regime integer. Counter-trend (SELL in bull / BUY in bear) is
-  // multiplicatively punished — directly targets the SELL 27% WR bleed. Uses regimeBrain strength
-  // proxies (emaPctSpread, rsi distance from 50) so a STRONG bull suppresses fades harder than a weak one.
+  // Patch 2.4: BTC context is diagnostic; neutral multiplier comes from the authority.
   const btcR = String(btcRegime.regime || 'UNKNOWN').toUpperCase();
-  if (btcR === 'CHOP' || localRegime === 'LOCAL_CHOP') maxTargetAtr = Math.min(maxTargetAtr, 2.2);
-  // strength 0..1 from how far BTC RSI is from neutral + ema spread magnitude (if available)
-  const _btcRsi = num(btcRegime.rsi, 50);
-  const _btcSpread = Math.abs(num(btcRegime.emaPctSpread, 0));
-  const regimeStrength = clamp(Math.abs(_btcRsi - 50) / 25 * 0.6 + Math.min(1, _btcSpread / 1.5) * 0.4, 0, 1); // 0..1
-  let regimeMult, regimeNote = '';
-  const aligned = (s, dir) => (dir === 'BUY'
-    ? ['BULL_TREND', 'BREAKOUT', 'BULL_RANGE'].includes(s)
-    : ['BEAR_TREND', 'BREAKOUT', 'BEAR_RANGE'].includes(s));
-  const opposed = (s, dir) => (dir === 'BUY' ? ['BEAR_TREND', 'BEAR_RANGE'].includes(s)
-                                             : ['BULL_TREND', 'BULL_RANGE'].includes(s));
-  // ── fix48n: REGIME-CONFLICT DETECTION (computed once, applied to both sides) ──
-  // regimeBrain classifies BTC purely on 15m EMA/RSI. In a real bear, dead-cat bounces
-  // trip BULL_TREND/BULL_RANGE (15m RSI pops to 52+, ema20>ema50 briefly) while sentinel
-  // breadth + composite still read deep bear. Observed live: 19/28 BUYs tagged BULL_TREND
-  // into a 93%-bear / Extreme-Fear tape, 32% WR. When the regimeBrain bull label is
-  // contradicted by breadth/composite the label is UNRELIABLE. We then treat the regime as
-  // NEUTRAL for BOTH sides (0.90): BUY loses its unearned tailwind, AND SELL loses the
-  // phantom counter-trend penalty it was getting for "opposing" a bull that isn't there.
-  // fix48n2 rationale: on paper, suppressing SELLs in a mislabeled bear starves the SELL
-  // sample — we can't test the SELL-in-bear edge. Neutral (not boosted) lets SELLs clear
-  // the gate on their own merit so the next session's SELL WR is a CLEAN read, not an
-  // artifact of us tipping the scale. Does NOT block, flip, force, or boost any side.
-  let _contestedBull = false, _conflictNote = '';
-  try {
-    const _s = (typeof sentinel?.getSentinel === 'function') ? sentinel.getSentinel() : null;
-    if (_s) {
-      // sentinel returns bull_pct:0 / composite:0 on NO data (cold start). num() coerces
-      // null→0, so require a populated pair_count before trusting breadth; composite 0 = neutral.
-      const _pairCount = num(_s.vol?.pair_count, 0);
-      const _bullPct   = _pairCount > 0 ? num(_s.vol?.bull_pct, 50) : null;
-      const _comp      = num(_s.composite_score, 0);
-      const _bullLbl   = ['BULL_TREND', 'BULL_RANGE', 'BREAKOUT'].includes(btcR);
-      const _breadthBear = (_bullPct != null) && _bullPct <= 30;  // ≤30% pairs bull
-      const _compBear    = _comp <= -3;                           // composite bearish/strong-bear
-      if (_bullLbl && (_breadthBear || _compBear)) {
-        _contestedBull = true;
-        _conflictNote = `REGIME_CONFLICT: BTC=${btcR} but breadth ${_bullPct==null?'n/a':_bullPct.toFixed(0)+'% bull'} / composite ${_comp} — regime treated neutral both sides`;
-      }
-    }
-  } catch (_e) { /* sentinel unavailable — _contestedBull stays false, fail safe */ }
-
-  if (_contestedBull) {
-    // Contested bull label → default behavior is NEUTRAL for whichever side we're scoring (0.90).
-    regimeMult = 0.90;
-    regimeNote = _conflictNote;
-    risks.push(_conflictNote);
-
-    // ── fix49p: CONFLICT BREADTH-LEAD EXPERIMENT (flag-gated, default OFF) ──────────────────
-    // Hypothesis: during BTC/breadth conflict, breadth SLOPE (not level) signals the true near-term
-    // direction early. The conflict state here is ALWAYS "BTC=bull label + breadth deep-bear (<=30%)"
-    // (that's what _contestedBull requires). Inside that state:
-    //   • breadth FALLING  → getting MORE bearish → lean SELL (SELL aligns with the real direction).
-    //   • breadth RISING   → recovering, but STILL <=30% = deep bear. Leaning BUY here = buying a
-    //     bounce inside a bear tape, which fix48n documented at 32% WR live. We do NOT lean BUY:
-    //     prior evidence says it loses, and the experiment's purpose is to probe where we're BLIND
-    //     (SELL-in-mislabeled-bear), not to re-run a known-losing BUY. When breadth genuinely
-    //     recovers it crosses >50, exits conflict, and the normal aligned-bonus path handles BUY.
-    // This asymmetry is deliberate and evidence-based (your hard rule permits justified asymmetry).
-    // Controls: OFF by default; small lean (0.96, never a full bonus); RR/score floors untouched;
-    // every leaned trade tagged (components._conflictLead); reversible via one settings toggle.
-    try {
-      if (getSettings().v4ConflictBreadthLead === true && side === 'SELL') {
-        const _slp = breadthSlope(getSettings());
-        if (_slp && _slp.dir === -1 && _slp.samples >= 3) { // breadth FALLING → confirm SELL
-          regimeMult = 0.96; // small lean toward SELL (the side breadth is trending toward)
-          regimeNote = `CONFLICT_BREADTH_LEAD_SELL: breadth falling ${_slp.firstPct}→${_slp.lastPct}% over ${_slp.windowMin}min — experimental early lean`;
-          risks.push(regimeNote);
-          components._conflictLead = {
-            side: 'SELL', leanSide: 'SELL', slope: _slp.slope, dir: _slp.dir,
-            firstPct: _slp.firstPct, lastPct: _slp.lastPct, netMove: _slp.netMove,
-            windowMin: _slp.windowMin, samples: _slp.samples, regimeMult
-          };
-        }
-      }
-    } catch (_e) { /* fail-safe: experiment never breaks scoring; neutral 0.90 stands */ }
-  } else if (aligned(btcR, side)) {
-    // aligned: strength helps. 1.00 (weak) → 1.20 (strong trend)
-    regimeMult = 1.00 + 0.20 * regimeStrength;
-    regimeNote = `BTC ${btcR} aligns ${side} (strength ${(regimeStrength*100).toFixed(0)}%)`;
-    confluence.push(regimeNote);
-  } else if (opposed(btcR, side)) {
-    // counter-trend: strength HURTS. 0.85 (weak/ranging) → 0.35 (strong opposing trend)
-    regimeMult = 0.85 - 0.50 * regimeStrength;
-    // localRegime can rescue a counter-trend fade slightly (e.g. SELL at LOCAL_BULL exhaustion)
-    if ((side === 'SELL' && localRegime === 'LOCAL_BULL') || (side === 'BUY' && localRegime === 'LOCAL_BEAR')) regimeMult += 0.08;
-    regimeMult = clamp(regimeMult, 0.30, 0.95);
-    risks.push(`counter-trend: BTC ${btcR} opposes ${side} (strength ${(regimeStrength*100).toFixed(0)}%)`);
-
-    // fix49k: BREADTH-OVERRIDE penalty neutralization (BOTH sides). Mirror of the btcRegimeDecision
-    // unblock. A side opposed by the BTC label, but breadth strongly agrees with that side: remove
-    // the counter-trend PENALTY (floor to neutral 0.90). No bonus added — hypothesis is "removing
-    // the regime veto lets breadth-aligned trades through", not "breadth deserves a reward".
-    //   BUY  rescued when breadth >= 70% bull under a bear label
-    //   SELL rescued when breadth <= 30% bull under a bull label
-    const _ovrSide = breadthOverrideSide(side, btcR, getSettings());
-    if (_ovrSide === side && regimeMult < 0.90) {
-      try {
-        const _sK = (typeof sentinel?.getSentinel === 'function') ? sentinel.getSentinel() : null;
-        const _pctK = num(_sK?.vol?.bull_pct, NaN);
-        regimeMult = 0.90; // penalty removed, no bonus
-        regimeNote = `BREADTH_OVERRIDE_${side}: breadth ${Number.isFinite(_pctK) ? _pctK.toFixed(0) : '?'}% bull vs ${btcR} label — counter-trend penalty neutralized`;
-        risks.push(regimeNote);
-        components._breadthOverride = { side, breadthPct: Number.isFinite(_pctK) ? Number(_pctK.toFixed(1)) : null, btcRegime: btcR };
-      } catch (_e) { /* fail-safe: penalty stands */ }
-    }
-  } else {
-    // CHOP / UNKNOWN — no directional edge from regime, but should NOT punish.
-    // fix48h-cal: 0.75→0.90. At 0.75 every signal during the post-restart UNKNOWN-regime warmup
-    // window scored ~44 and the system went fully silent. 0.90 is neutral: no help, no penalty.
-    regimeMult = 0.90;
-    if (btcR === 'CHOP') risks.push('BTC chop — regime gives no directional edge');
-  }
-
+  const regimeStrength = 0;
+  let regimeMult = sideAllowance.scoreRegimeMultiplier;
+  const regimeNote = sideAllowance.reason;
+  const _contestedBull = false;
+  if (localRegime === 'LOCAL_CHOP') maxTargetAtr = Math.min(maxTargetAtr, 2.2);
   // ── fix49h(H3): FRESH-REGIME NEUTRALIZATION ───────────────────────────────
   // A regime label minutes old carries no proof. 06/10 evening: a 3-hour-old bounce flipped the
   // labels bull, the score paid 81-98 to BUYs (regimeMult 1.1-1.2) and the bounce died → 2W/4L
@@ -2835,6 +2759,10 @@ function buildStructurePlan(ctx, settings, btcRegime) {
       volRatio: num(volRatio, 1),
       elliottAnalysis,
     });
+  }
+  decision.marketPermission=currentMarketPermission();
+  if(decision.side!=='NEU' && !marketPolicy.allows(decision.marketPermission,decision.side)) {
+    decision={...decision,side:'NEU',reasons:[...(decision.reasons||[]),'BREADTH_SIDE_BLOCKED']};
   }
   if (decision.side === 'NEU') return { ok: false, reason: 'NO_DIRECTION', leader: { symbol, score: 0, side: 'NEU', dirMode: _dirMode, dirReasons: decision.reasons || [] } };
 
@@ -3493,32 +3421,42 @@ function computeEntryTiming(ctx, plan, side, atr, settings = currentSettings()) 
   };
 }
 
+function recordWithhold24(s,reason,at,price){
+  const episodes=s.withheldEpisodes||(s.withheldEpisodes=[]);
+  let e=episodes[episodes.length-1];
+  if(!e||e.reason!==reason){e={reason,firstAt:at,lastAt:at,count:0,firstPrice:price,lastPrice:price,minPrice:price,maxPrice:price,samples:[]};episodes.push(e);require('./executionParity').appendEvent(s,'ORDER_WITHHELD',at,{reason,episode:episodes.length});}
+  e.samples.push([at-e.firstAt,price]);
+  e.count++;e.lastAt=at;e.lastPrice=price;e.minPrice=Math.min(e.minPrice,price);e.maxPrice=Math.max(e.maxPrice,price);
+}
+function timingDiagnostics24(s,price,atr,timing){
+  const leader={...s,price,plan:{entry:s.entry}};
+  const total=deriveEntryTimingScore(leader,timing),base=deriveEntryTimingScore(leader,{});
+  const threshold=Math.max(1,Number(process.env.V4_TIMING_BLOCK_THRESHOLD||'44'));
+  const tolerance=entryToleranceAbs(s.entry,atr,currentSettings());
+  // Exact breakpoints of the piecewise proximity function, plus both endpoints.
+  const points=[0,tolerance,...[0.0015,0.003,0.005,0.01].flatMap(f=>[s.entry*f-1e-10,s.entry*f,s.entry*f+1e-10])].filter(x=>x>=0&&x<=tolerance);
+  const reaction=entryReactionAbs(s.entry,atr,currentSettings())*(s.hadFirstTouch?.5:1);
+  const touch=Number(s.entryZoneTouchPrice)||s.entry;
+  const requiredDistance=Math.max(0,s.side==='BUY'?touch-s.entry:s.entry-touch)+reaction;
+  const scores=points.map(x=>deriveEntryTimingScore({...leader,price:s.side==='BUY'?s.entry+x:s.entry-x},{inZone:true,directional:true}));
+  return {total,proximityAndPenalties:base,inZoneBonus:timing.inZone?8:0,directionalBonus:timing.directional?14:0,threshold,
+    policyHeld:total>=threshold,meaning:'PROXIMITY_CONFIRMATION_SCORE_NOT_LATENCY',
+    feasibility:{assumption:'FROZEN_CURRENT_INPUTS_FAVORABLE_ZONE_CONFIRMATION',reactionRequired:requiredDistance,zoneTolerance:tolerance,reactionFeasible:requiredDistance<=tolerance,min:Math.min(...scores),max:Math.max(...scores),allBlocked:scores.every(x=>x>=threshold)}};
+}
 function signalEntryTiming(s, price, atr, now, settings = currentSettings()) {
   const entry = num(s?.entry);
   const tolerance = entryToleranceAbs(entry || price, atr, settings);
   const reaction = entryReactionAbs(entry || price, atr, settings);
   const inZone = !!(price && entry && Math.abs(price - entry) <= tolerance);
 
-  // FIX B: Missed-move detection — if price ran PAST entry in the right direction by > 0.5 ATR
-  // without pulling back, activate immediately (breakout/continuation entry).
-  // This prevents high-score setups from expiring when price trends through without a pullback.
-  if (!inZone && price && entry && atr > 0) {
-    const missedMoveThreshold = atr * num(settings.v4MissedMoveAtr, 0.5);
-    const priceBeyondForBuy  = s?.side === 'BUY'  && price > entry + missedMoveThreshold;
-    const priceBeyondForSell = s?.side === 'SELL' && price < entry - missedMoveThreshold;
-    if (priceBeyondForBuy || priceBeyondForSell) {
-      return {
-        inZone: true,
-        directional: true,
-        tolerance,
-        reaction,
-        expiredWindow: false,
-        missedMove: true,
-        reason: `ENTRY_CONFIRMED: missed-move breakout — price ran ${((Math.abs(price - entry) / atr).toFixed(2))}ATR past entry in trade direction`,
-      };
-    }
-  }
-
+  const favorableDistance = s.side === 'BUY' ? price-entry : entry-price;
+  const missedMove = !inZone && atr>0 && favorableDistance>atr*num(settings.v4MissedMoveAtr,0.5);
+  const birthValue=s.priceAtBirth??s.price;
+  const birthPrice=birthValue!=null&&Number(birthValue)>0?Number(birthValue):NaN;
+  s.missedMoveDiagnostics={distanceFromEntryAtr:atr>0?favorableDistance/atr:null,
+    birthDistanceAtr:atr>0 && Number.isFinite(birthPrice)?(s.side==='BUY'?birthPrice-entry:entry-birthPrice)/atr:null,
+    movementSinceBirthAtr:atr>0 && Number.isFinite(birthPrice)?(s.side==='BUY'?price-birthPrice:birthPrice-price)/atr:null,
+    classification:missedMove?'UNPLACED_PRICE_BEYOND_LIMIT':'NOT_MISSED', detectionLatency:'NOT_MEASURED'};
   // Reset the reaction latch when price leaves the entry zone. The old code kept
   // entryZoneTouchedAt forever, so a late move could activate a stale setup.
   if (!inZone) {
@@ -3533,7 +3471,7 @@ function signalEntryTiming(s, price, atr, now, settings = currentSettings()) {
       s.entryZoneTouchPrice = null;
       s.directionalSince = null; // fixHOLD: leaving the zone resets the reaction-hold clock
     }
-    return { inZone, directional: false, tolerance, reaction, expiredWindow: false, reason: 'WAITING_ENTRY: price outside tight entry zone' };
+    return { inZone, directional: false, tolerance, reaction, missedMove, expiredWindow: false, reason: missedMove ? 'ORDER_WITHHELD: unplaced price beyond planned limit; detection latency not established' : 'WAITING_ENTRY: price outside tight entry zone' };
   }
 
   if (!s.entryZoneTouchedAt) {
@@ -3812,6 +3750,7 @@ function dedupeLiveSignals(list = []) {
 }
 
 function refreshSignalPlan(existing, candidate, reason = 'REFRESHED_WAITING_SETUP') {
+  if(existing?.executionPosition?.intent?.status==='ACCEPTED'||existing?.tradeId||existing?.liveOrderId)return false;
   if (!existing || !candidate || existing.paperState === 'PAPER_ACTIVE') return false;
   if (!['WAITING_ENTRY', 'WAITING_REACTION'].includes(existing.paperState)) return false;
   const oldScore = num(existing.score), newScore = num(candidate.score);
@@ -3874,75 +3813,9 @@ function btcUnknownHighConfidenceOk(leader) {
 
 // fix24-b: btcRegimeDecision updated for 6-state regime labels
 function btcRegimeDecision(leader, settings, btcUnknownException = false) {
-  const mode = String(settings.btcRegimeMode || 'direction_match').toLowerCase();
-  const regime = String(leader.btcRegime || 'UNKNOWN').toUpperCase();
-  const side = String(leader.side || '').toUpperCase();
-  const reasons = [];
-  const warnings = [];
-
-  if (mode === 'off') return { reasons, warnings: ['BTC_REGIME_FILTER_OFF'] };
-
-  if (!regime || regime === 'UNKNOWN') {
-    warnings.push(btcUnknownException ? 'BTC_UNKNOWN_HIGH_CONFIDENCE_EXCEPTION' : 'BTC_REGIME_UNKNOWN_NEUTRAL');
-    if ((mode === 'strict' || settings.rejectUnknownBtcRegime) && !btcUnknownException) reasons.push('BTC_REGIME_UNKNOWN');
-    return { reasons, warnings };
-  }
-
-  if (regime === 'CHOP') {
-    // fix39: CHOP no longer hard-blocks in direction_match mode.
-    // calibratedScore already applies -12 penalty for CHOP. Hard block = zero signals.
-    // strict mode still blocks.
-    warnings.push('BTC_CHOP_REGIME');
-    if (mode === 'strict') reasons.push('BTC_CHOP_BLOCKS_TRADE');
-    return { reasons, warnings };
-  }
-
-  // Hard blocks — regime directly opposed to side.
-  // FIX: sentinelBrain emits STRONG_BULL/BULL/CHOP/BEAR/STRONG_BEAR — not old BEAR_TREND/BULL_TREND labels.
-  // fix36: regimeBrain emits BULL_TREND/BEAR_TREND/BULL_RANGE/BEAR_RANGE/BREAKOUT/CHOP
-  // sentinelBrain emits STRONG_BULL/BULL/CHOP/BEAR/STRONG_BEAR.
-  // leader.btcRegime = regimeBrain.regime. Normalize both namespaces here.
-  const BULL_REGIMES = ['STRONG_BULL', 'BULL', 'BULL_TREND', 'BREAKOUT'];
-  const BEAR_REGIMES = ['STRONG_BEAR', 'BEAR', 'BEAR_TREND'];
-
-  if (side === 'BUY' && BEAR_REGIMES.includes(regime)) {
-    // fix49k: BREADTH-OVERRIDE BUY-rescue. Strong bull breadth under a bear label → don't block.
-    if (breadthOverrideSide('BUY', regime, settings) === 'BUY') {
-      warnings.push(`BREADTH_OVERRIDE_BUY_${regime}`);
-    } else if (mode === 'direction_match' || mode === 'strict') {
-      reasons.push(`BTC_${regime}_BLOCKS_BUY`);
-      return { reasons, warnings };
-    } else {
-      warnings.push(`BTC_${regime}_WEAK_FOR_BUY`);
-    }
-  }
-  if (side === 'SELL' && BULL_REGIMES.includes(regime)) {
-    // fix49k: BREADTH-OVERRIDE SELL-rescue (mirror). Heavy bear breadth under a bull label → don't
-    // block. This is the case that bit us live: breadth 24.8% bull, label still BULL, SELL hard-
-    // blocked, BUYs losing into a 74%-bear tape with no way to short it.
-    if (breadthOverrideSide('SELL', regime, settings) === 'SELL') {
-      warnings.push(`BREADTH_OVERRIDE_SELL_${regime}`);
-    } else if (mode === 'direction_match' || mode === 'strict') {
-      reasons.push(`BTC_${regime}_BLOCKS_SELL`);
-      return { reasons, warnings };
-    } else {
-      warnings.push(`BTC_${regime}_WEAK_FOR_SELL`);
-    }
-  }
-
-  // neutral_allowed mode: add warning but don't block for aligned trades
-  if (mode === 'neutral_allowed') {
-    if (side === 'BUY' && !BULL_REGIMES.includes(regime) && !BEAR_REGIMES.includes(regime)) warnings.push('BTC_CHOP_NEUTRAL_FOR_BUY');
-    if (side === 'SELL' && !BEAR_REGIMES.includes(regime) && !BULL_REGIMES.includes(regime)) warnings.push('BTC_CHOP_NEUTRAL_FOR_SELL');
-  }
-
-  // Strict mode: require exact alignment
-  if (mode === 'strict') {
-    if (side === 'BUY' && !BULL_REGIMES.includes(regime)) reasons.push(`BTC_${regime}_NOT_BULLISH_FOR_BUY`);
-    if (side === 'SELL' && !BEAR_REGIMES.includes(regime)) reasons.push(`BTC_${regime}_NOT_BEARISH_FOR_SELL`);
-  }
-
-  return { reasons, warnings };
+  const permission = currentMarketPermission();
+  leader.marketPermission=permission;
+  return {reasons:marketPolicy.allows(permission,leader.side)?[]:['BREADTH_SIDE_BLOCKED_'+leader.side],warnings:[permission.reason],marketPermission:permission};
 }
 
 function globalRiskBlockReason(signals = [], settings = currentSettings()) {
@@ -4035,74 +3908,12 @@ function shouldReject(leader, settings, signals = []) {
     warnings.push(`SENTINEL_BTC_CONFLICT:sentinel=${sent.market_regime},btcMtf=${leader.btcRegime}`);
   }
 
-  // fix48i: NARROW, SAFE sentinel side-block (re-enabled with strict guards).
-  // The old sentinel gating throttled the whole system via stacking score_adj inflation AND still
-  // let losers through (it adjusted gates but never blocked the side). This is different: a single
-  // binary side-block that ONLY fires when the sentinel is FRESH, READY, and has explicitly removed
-  // this side from allowed_sides because the regime opposes it. It cannot inflate gates, cannot
-  // affect the other side, and self-disables the moment the sentinel goes stale (anti-throttle).
-  // Data (02:36 flip): APT/NEAR SELLs fired 2-3 min AFTER BEAR→BULL — this is exactly that case.
-  const _sentAllowed = Array.isArray(sent && sent.allowed_sides) ? sent.allowed_sides.map(x => String(x).toUpperCase()) : null;
-  const _sideUp = String(leader.side || '').toUpperCase();
-  const _sentClearRegime = ['STRONG_BULL', 'BULL', 'STRONG_BEAR', 'BEAR'].includes(String(sent && sent.market_regime || '').toUpperCase());
-  const _sentinelSideBlock =
-    sentimentReady &&            // regime is known
-    !sentinelStale &&            // data is fresh (<5 min) — stale sentinel CANNOT block
-    _sentClearRegime &&          // only in a clear directional regime (never in CHOP/UNKNOWN)
-    Array.isArray(_sentAllowed) &&
-    _sentAllowed.length > 0 &&   // sentinel actually computed sides (not empty/error state)
-    !_sentAllowed.includes(_sideUp); // and this side is NOT permitted
-  // fix49k: BREADTH-OVERRIDE supersedes the sentinel side-block too (full allowed). When breadth
-  // strongly disagrees with the label, the SENTINEL_SIDE_BLOCKED gate is keyed on the SAME lagging
-  // composite label that the override is overriding — so letting it re-block would only half-open
-  // the door. Tonight's live case: BULL label + 24% breadth + allowed_sides=[BUY] → SELL hit BOTH
-  // the BTC-label block AND this one; the override must beat both or the SELL never fires.
-  const _breadthOvr = breadthOverrideSide(_sideUp, String(leader.btcRegime || '').toUpperCase(), settings);
-  if (_sentinelSideBlock && _breadthOvr === _sideUp) {
-    warnings.push(`BREADTH_OVERRIDE_${_sideUp}_BEATS_SENTINEL_BLOCK_regime=${sent.market_regime}`);
-  } else if (_sentinelSideBlock) {
-    reasons.push(`SENTINEL_SIDE_BLOCKED_${_sideUp}_regime=${sent.market_regime}`);
-  }
-  // NOTE: sentinel score/RR gate INFLATION remains disabled — only the binary side-block above is active.
-
-  // fix49h(H2): BREADTH-FIGHTING GATE. Strongest validated finding at n=196 closed trades:
-  // breadth-ALIGNED trades = 65% WR, +0.26U/trade; breadth-FIGHTING = 38% WR, +0.05U/trade (zero
-  // expectancy, pure variance). Graded by design — the goal is filtering the bad, not cutting reach:
-  //   HARD reject (extremes, data-clear):  BUY at breadth <= 30% bull  |  SELL at >= 70% bull
-  //   WARN only (thin bands, n<=2 — collect): BUY 30-40  |  SELL 60-70
-  // Fail-open: no breadth data, or last-known snapshot older than 30 min → warn, never block
-  // (the old sentinel gating throttled the whole system when stale — never again).
-  // Uses getSentinelForCapture(): live sentinel with last-known-good fallback, so a sentinel gap
-  // at signal time no longer means an ungated trade (also the null-capture fix direction).
-  // Tunable without redeploy: V4_BUY_MIN_BREADTH (default 30), V4_SELL_MAX_BREADTH (default 70).
-  let _breadthGate = { pct: null, usable: false, stale: false };
-  try {
-    const { sent: _bSent, stale: _bStale, ageMs: _bAgeMs } = getSentinelForCapture();
-    const _bPairs = num(_bSent?.vol?.pair_count, 0);
-    const _bPct = _bPairs > 0 ? num(_bSent?.vol?.bull_pct, NaN) : NaN;
-    const _bUsable = Number.isFinite(_bPct) && (!_bStale || _bAgeMs <= 30 * 60 * 1000);
-    _breadthGate = { pct: Number.isFinite(_bPct) ? Number(_bPct.toFixed(1)) : null, usable: _bUsable, stale: !!_bStale };
-    if (_bUsable) {
-      // fix49o: 30/70 -> 50/50 MIRRORED. 191-trade pooled analysis: BUY edge needs breadth >=50%
-      // (<50% was a losing zone, 33-0% WR across buckets); SELL edge needs breadth <=50% (>=65%
-      // bull was where SELL lost). Both constants clamp at 50 by design (BUY_MIN_BREADTH max=50,
-      // SELL_MAX_BREADTH min=50) so this sits exactly at each function's hard limit — confirmed
-      // intentional ceiling/floor, not a workaround. Soft-warn thresholds (BUY<=65, SELL>=35) tag the
-      // marginal band just past the hard floor; they are COSMETIC ONLY (pushed to gate.warnings,
-      // never read by scoring) — if ever promoted to a real penalty, re-validate the band vs data first.
-      const BUY_MIN_BREADTH  = Math.max(0, Math.min(50, Number(process.env.V4_BUY_MIN_BREADTH  || '50')));
-      const SELL_MAX_BREADTH = Math.max(50, Math.min(100, Number(process.env.V4_SELL_MAX_BREADTH || '50')));
-      if (_sideUp === 'BUY') {
-        if (_bPct <= BUY_MIN_BREADTH) reasons.push(`BREADTH_FIGHT_BUY_${_bPct.toFixed(0)}PCT_LE_${BUY_MIN_BREADTH}`);
-        else if (_bPct <= 65) warnings.push(`BREADTH_SOFT_BUY_${_bPct.toFixed(0)}PCT`);
-      } else if (_sideUp === 'SELL') {
-        if (_bPct >= SELL_MAX_BREADTH) reasons.push(`BREADTH_FIGHT_SELL_${_bPct.toFixed(0)}PCT_GE_${SELL_MAX_BREADTH}`);
-        else if (_bPct >= 35) warnings.push(`BREADTH_SOFT_SELL_${_bPct.toFixed(0)}PCT`);
-      }
-    } else {
-      warnings.push('BREADTH_UNAVAILABLE_NO_GATE');
-    }
-  } catch (_e) { warnings.push('BREADTH_GATE_ERROR_NO_GATE'); }
+  const permission = currentMarketPermission();
+  leader.marketPermission=permission;
+  const _sideUp=String(leader.side||'').toUpperCase();
+  const _breadthGate={...permission};
+  if(!marketPolicy.allows(permission,_sideUp)) reasons.push('BREADTH_SIDE_BLOCKED_'+_sideUp);
+  warnings.push(permission.reason);
 
   // fixPCTL: BREADTH-PERCENTILE EXTREME — SHADOW ONLY, never blocks. Live 07/18: 5 SELL losses at
   // breadthRangePctile 97-99 all passed the absolute-breadth gate above because bull_pct sat at
@@ -4346,6 +4157,7 @@ function shouldReject(leader, settings, signals = []) {
     risks: leader.risks,
     scoring: leader.scoreInfo || leader.scoring || null
   }, settings);
+  reconcileScoreAdmission(leader,gate);
   return gate;
 }
 
@@ -4513,6 +4325,7 @@ function signalFromLeader(leader, settings) {
     positionStatus: state === 'PAPER_ACTIVE' ? 'PAPER' : 'NONE',
     orderStatus: 'NOT_SENT_PAPER',
     score: leader.score,
+    priceAtBirth:price,scoreAdmission:leader.scoreAdmission||null,marketPermission:leader.marketPermission||currentMarketPermission(),
     setupScore: leader.score,
     regimeAlignment: leader.scoreInfo?.regimeAlignment || 0,
     btcRegime: leader.btcRegime,
@@ -4613,6 +4426,11 @@ function getSignals() {
 }
 
 function saveSignals(signals) {
+  for(const s of signals||[]) {
+    if(s.entryHit)observations.link(s);
+    else if(FINAL_STATES.has(s.paperState))observeDecision24(s,s.paperState,s.stateReason||s.paperState,s.closedAt||Date.now());
+  }
+  observations.flush();
   // fixSAVE: LAST-WRITE-WINS HARDENING. The scan loop holds its signals array across awaits and
   // saves at end-of-tick; executor callbacks save fresh copies mid-tick. The scan's stale array then
   // overwrote the callback's live-link writes (tradeId/orderId/orderClaimAt/...) — the race behind
@@ -4761,6 +4579,9 @@ function tradeKey(s) {
 // called nowhere near an order-placement path. Purpose: gather real agreement/divergence data before
 // ever promoting this to be the actual gate paper (and eventually live) uses.
 function decideLiveEntry(s, market, timing, settings, atr, activeCount) {
+  const permission=currentMarketPermission();
+  s.marketPermission=permission;
+  if(!marketPolicy.allows(permission,s.side))return {wouldPlace:false,reason:'BREADTH_SIDE_BLOCKED_'+s.side,marketPermission:permission};
   if (timing.missedMove) return { wouldPlace: false, reason: 'MISSED_MOVE_EXEMPT' };
 
   const kCandle = market && market.candle;
@@ -4836,6 +4657,9 @@ function normalizeLedgerTrade(s) {
     id: s.id || s.signalId || key,
     key,
     planKey,
+    patchVersion:'PATCH-2.4',scoreAdmission:s.scoreAdmission||null,marketPermission:s.marketPermission||null,
+    missedMoveDiagnostics:s.missedMoveDiagnostics||null,timingDiagnostics:s.timingDiagnostics||null,
+    timingHoldCount:s.timingHoldCount||0,withheldEpisodes:s.withheldEpisodes||[],pendingFillDiagnostic:s.pendingFillDiagnostic||null,
     sym: s.sym,
     symbol: s.sym || s.symbol,
     side: s.side,
@@ -4914,6 +4738,8 @@ function getLedger() {
 }
 
 function saveLedger(rows) {
+  for(const row of rows||[])if(!row.entryHit&&FINAL_STATES.has(row.paperState))observeDecision24(row,row.paperState,row.stateReason||row.paperState,row.closedAt||Date.now());
+  observations.flush();
   const now = Date.now();
   const liveTrades = store.read('trades', {}) || {};
   const liveBySignal = new Map(Object.values(liveTrades).filter(t => t && t.signalId && t.liveExecutionEvidence).map(t => [t.signalId, t]));
@@ -5412,12 +5238,19 @@ function reconcileOrphanedLedgerRows(ledger, signals) {
     const st = String(r.paperState || '').toUpperCase();
     const rid = r.id || r.key || ledgerKey(r);
     if (ACTIVE_STATES.has(st) && rid && !liveIds.has(rid)) {
+      if(r.executionPosition?.remainingQty>0){
+        // An absent signal is not evidence that a filled position expired.
+        signals.push({...r,paperState:'PAPER_ACTIVE',displayState:'PAPER_ACTIVE',positionStatus:'PAPER'});
+        return r;
+      }
+      if(!r.tradeId&&!r.liveOrderId)paperOrders.cancel(r.executionPosition,now,'LOST_ACTIVE_WINDOW');
       reconciledCount++;
       return {
         ...r,
         paperState: 'EXPIRED', displayState: 'EXPIRED', status: 'EXPIRED', positionStatus: 'NONE',
         updatedAt: now, closedAt: r.closedAt || now,
         stateReason: `${V4_VERSION}: reconciled — lost from live signal window, never resolved (was '${r.paperState}')`,
+        history:[...(r.history||[]),{at:now,state:'EXPIRED',reason:'LOST_ACTIVE_WINDOW'}],
       };
     }
     return r;
@@ -6162,6 +5995,7 @@ function finalizeActiveDiagnostics(s, now) {
 //   OK      → thesis intact; normal timing logic proceeds.
 // `market` may carry fresh 5m context (closes5/rsi5/atr5) injected by enrichOpenSignalMarketMap.
 function revalidateWaitingSignal(s, market, price, now) {
+  s.marketPermission=currentMarketPermission(now);
   const side = String(s.side || '').toUpperCase();
   const age = now - num(s.createdAt, now);
   if (age < REVAL_MIN_AGE_MS) return { action: 'OK', reason: '' };
@@ -6169,24 +6003,9 @@ function revalidateWaitingSignal(s, market, price, now) {
   const entry = num(s.entry), sl = num(s.sl);
   const riskAbs = Math.abs(entry - sl) || 0;
 
-  // ── 1. REGIME DRIFT (the big one) ────────────────────────────────────────
-  // Re-run the directional thesis against the CURRENT btc + local regime.
-  // If the signal's side is no longer permitted, the reason it was born is gone.
-  const btc = btcRegimeStrength();
-  const liveLocal = s.localRegime || s.scoreInfo?.localRegime || market.localRegime || 'LOCAL_UNKNOWN';
-  try {
-    const allow = getAllowedSides(btc.regime, liveLocal);
-    const sideAllowedNow = side === 'BUY' ? allow.allowedBuy : allow.allowedSell;
-    const bornRegime = s.diag?.btcRegimeAtEntry || s.scoreInfo?.btcRegime || s.btcRegime;
-    if (!sideAllowedNow && btc.regime && btc.regime !== 'UNKNOWN') {
-      // only abandon if the regime actually CHANGED from birth (avoid abandoning on a borderline
-      // setup that was always weak — those are the planner's job, not the guard's)
-      if (bornRegime && String(bornRegime).toUpperCase() !== String(btc.regime).toUpperCase()) {
-        return { action: 'ABANDON', reason: `regime drifted ${bornRegime}→${btc.regime}; ${side} no longer permitted (${allow.blockReason || 'side blocked'})` };
-      }
-    }
-  } catch (_e) { /* getAllowedSides unavailable — skip regime check */ }
-
+  // Breadth-first: BTC cannot cancel a compatible waiting side.
+  const permission=currentMarketPermission(now);
+  s.marketPermission=permission;
   // ── 2. ADVERSE PRE-ENTRY DRIFT ───────────────────────────────────────────
   // If price has already drifted toward SL by > REVAL_ADVERSE_DRIFT_FRAC of the entry→SL distance
   // BEFORE the trade even fills, the structure is breaking. Don't buy a falling knife into the limit.
@@ -6226,12 +6045,10 @@ function revalidateWaitingSignal(s, market, price, now) {
   // thresholds + same getSentinelForCapture() snapshot the creation gate uses. Fails OPEN on a
   // stale/missing breadth read (never freezes the system on a data gap).
   try {
-    const BUY_MIN_BREADTH  = Math.max(0, Math.min(50, Number(process.env.V4_BUY_MIN_BREADTH  || '50')));
-    const SELL_MAX_BREADTH = Math.max(50, Math.min(100, Number(process.env.V4_SELL_MAX_BREADTH || '50')));
-    const { sent: _bSent, stale: _bStale, ageMs: _bAgeMs } = getSentinelForCapture();
-    const _bPairs = num(_bSent?.vol?.pair_count, 0);
-    const _bPct = _bPairs > 0 ? num(_bSent?.vol?.bull_pct, NaN) : NaN;
-    const _bUsable = Number.isFinite(_bPct) && (!_bStale || _bAgeMs <= REVAL_BREADTH_FIGHT_MAX_AGE_MS);
+    const permission=currentMarketPermission(now);
+    const BUY_MIN_BREADTH=permission.buyMinExclusive, SELL_MAX_BREADTH=permission.sellMaxExclusive;
+    const _bPct=permission.pct, _bUsable=permission.usable;
+    if (!_bUsable) s._breadthFightSince=0;
     if (_bUsable) {
       const fighting = (side === 'BUY' && _bPct <= BUY_MIN_BREADTH) || (side === 'SELL' && _bPct >= SELL_MAX_BREADTH);
       if (fighting) {
@@ -6462,6 +6279,7 @@ function buildFlipChild(parent, market, price, now, settings) {
 }
 
 function flagTradeForCancel(s, why) {
+  if(s&&!s.tradeId&&!s.liveOrderId)paperOrders.cancel(s.executionPosition,Date.now(),why);
   if (!s || !s.tradeId) return;
   try {
     const trades = store.read('trades', {});
@@ -6514,6 +6332,7 @@ function updateExistingSignals(signals, priceMap) {
   const now = Date.now();
   const settings = currentSettings();
   let changed = false;
+  observations.observe(priceMap,now);
   const _flipChildren = []; // fixFLIP: opposite-side children built mid-loop, appended after iteration
   // fixPHASE1PERF (07/31, hotfix36) — REAL BUG, confirmed via user's reported backend timeouts
   // (gradual, backend-only, tracked the recent v4Brain hotfixes — pointed straight here). Phase 1's
@@ -6533,11 +6352,52 @@ function updateExistingSignals(signals, priceMap) {
     // an authority pass so a late fill can be re-claimed. It is a RECLAIM pass only: paper logic is
     // never re-run on a final signal (see the `_finalNow` guard right after the authority block).
     const _finalNow = FINAL_STATES.has(s.paperState);
-    if (_finalNow && !reclaimableFinal(s)) continue;
+    const latePaperOrder=!s.tradeId&&!s.liveOrderId&&s.executionPosition?.cancelState==='ACKNOWLEDGED'&&s.executionPosition.status!=='CLOSED'&&s.executionPosition.intent.requestedQty-s.executionPosition.filledQty>1e-12&&s.executionPosition.cancelAcknowledgedAt!=null;
+    if (_finalNow && !reclaimableFinal(s) && !latePaperOrder) continue;
 
     const market = priceMap.get(s.sym) || priceMap.get(s.symbol) || {};
-    const price = num(market.markPrice || market.lastPrice || market.close || s.backendLastPrice);
+    const price = num(market.lastPrice || market.markPrice || market.close || s.backendLastPrice);
     const prevState = s.paperState;
+    const q24=paperOrders.quote(market,now);
+    s.lastPriceSourceAt=q24.valid?q24.at:null;s.lastPriceReceivedAt=q24.valid?q24.receivedAt:null;
+    if(!s.tradeId && !s.liveOrderId && (paperOrders.working(s.executionPosition)||latePaperOrder)) {
+      const p=s.executionPosition;
+      // The accepted order owns its side and bracket, regardless of later planner refreshes.
+      s.side=p.intent.side;
+      if(!p.filledQty){s.entry=p.intent.plannedEntry;s.plannedEntry=p.intent.plannedEntry;s.sl=p.intent.sl;s.tp1=p.intent.tp;}
+      const fill=paperOrders.tick(p,market,now,FEE_RATE);
+      if(latePaperOrder&&!fill.filled&&_finalNow)continue;
+      s.executionIntent=p.intent;
+      s.pendingFillDiagnostic={at:now,reason:fill.reason||'FILLED',sourceAt:q24.at};
+      if(fill.filled){
+        s.avgFillPrice=p.avgFillPrice;s.entryHit=true;s.openedAt=p.openedAt;s.closedAt=null;
+        s.paperState='PAPER_ACTIVE';s.status='ACTIVE';s.displayState='PAPER_ACTIVE';s.positionStatus='PAPER';
+        s.executionReason='PATCH-2.4: acknowledged limit filled on later fresh retrace';s.stateReason=s.executionReason;
+        s.history=[...(s.history||[]),{at:p.openedAt,state:'PAPER_ACTIVE',reason:s.executionReason,intentId:p.intent.intentId,price:q24.price,qty:p.filledQty}];
+        if(!s._paper24DiagnosticsInitialized){initActiveDiagnostics(s,q24.price,num(s.planner?.keyLevels?.atr,Math.abs(p.intent.plannedEntry-p.intent.sl)),now,settings);s._paper24DiagnosticsInitialized=true;}
+        observations.link(s);changed=true;
+      }
+      if(p.filledQty>0){
+        // A partial entry leaves a real open position. Cancel remaining size on a
+        // later adverse/expiry decision; never erase the filled quantity.
+        if(paperOrders.working(p)){
+          const rv=q24.valid?revalidateWaitingSignal({...s,entry:p.intent.plannedEntry,sl:p.intent.sl},market,q24.price,now):{action:'OK'};
+          if(rv.action!=='OK'||now-signalBirthMs(s)>Math.min(num(s.expireMs,expiryMsFor(settings)),WAITING_HARD_CAP_MS))paperOrders.cancel(p,now,rv.reason||'EXPIRED_REMAINDER');
+        }
+        if(fill.filled){changed=true;continue;}
+      } else {
+        const rv=q24.valid?revalidateWaitingSignal({...s,entry:p.intent.plannedEntry,sl:p.intent.sl},market,q24.price,now):{action:'OK'};
+        const expired=now-signalBirthMs(s)>Math.min(num(s.expireMs,expiryMsFor(settings)),WAITING_HARD_CAP_MS);
+        if(expired||isDeadHourLK(now)||rv.action!=='OK'||(q24.valid&&!require('./executionParity').geometry(p.intent.side,q24.price,p.intent.sl,p.intent.tp).ok)){
+          const reason=expired?'ORDER_EXPIRED':rv.reason||'ORDER_SAFETY_CANCEL';paperOrders.cancel(p,now,reason);
+          s.paperState=expired?'EXPIRED':'STALE_CANCELLED';s.status=s.paperState;s.displayState=s.paperState;s.closedAt=now;s.stateReason=reason;
+          s.history=[...(s.history||[]),{at:now,state:s.paperState,reason}];
+          observeDecision24(s,s.paperState,reason,now,market);
+        } else {s.paperState='WAITING_ENTRY';s.displayState='PAPER_PENDING_FILL';}
+        changed=true;continue;
+      }
+    }
+
 
     // fix49h(H1): LIVE STATE AUTHORITY now runs FIRST — before the fix48g no-price expiry block.
     // In 49g it ran after the price guard, so the early-expiry block could kill a signal with a
@@ -6698,6 +6558,9 @@ function updateExistingSignals(signals, priceMap) {
     }
 
     if (!price) continue;
+    if(!s.entryHit && !s.tradeId && !s.liveOrderId && !q24.valid){
+      s.pendingFillDiagnostic={at:now,reason:'STALE_OR_MISSING_PRICE'};changed=true;continue;
+    }
 
     s.backendLastPrice = roundPrice(price);
     s.updatedAt = now;
@@ -6805,6 +6668,8 @@ function updateExistingSignals(signals, priceMap) {
       }
       if (s.revalFrozen) { s.revalFrozen = false; s.revalFreezeReason = null; } // momentum/vol recovered
       const timing = signalEntryTiming(s, price, atr, now, settings);
+      s.entryTiming=timing;
+      s.timingDiagnostics=timingDiagnostics24(s,price,atr,timing);
       // fixPHASE1: shadow-only — compares the unified decision engine against what actually happened.
       // Zero effect on the branches below (no mutation, no continue/return, purely a log side-effect).
       try {
@@ -6866,7 +6731,7 @@ function updateExistingSignals(signals, priceMap) {
         }
         phase0Trace(s, 'WITHHELD_KNIFE_RETEST', { knife: 'withheld' });
       } else if (settings.botMode === 'LIVE_REAL_BYBIT' && settings.tradingEnabled && s.hadFirstTouch &&
-          !timing.missedMove && !s._autoTraded && !s.liveOrderId && !s.tradeId) {
+          !timing.missedMove && timing.inZone && timing.directional && !s.timingDiagnostics.policyHeld && passesScoreBand(s.score) && marketPolicy.allows(currentMarketPermission(now),s.side) && !s._autoTraded && !s.liveOrderId && !s.tradeId) {
         const { placeLimitAtEntry: _placeLimitRetest, activeTrades: _atRetest } = require('./executor');
         if (sentinelBlind()) {
           addLog('LIVE_BLIND_SKIP', `${s.symbol} ${s.side} — sentinel blind >10min, resting limit withheld`);
@@ -6897,16 +6762,17 @@ function updateExistingSignals(signals, priceMap) {
         }
       }
 
-      if (timing.inZone && timing.directional) {
-        if (timing.missedMove) {
+      if (timing.missedMove && !s.tradeId && !s.liveOrderId) {
           const parity = require('./executionParity');
           s.executionIntent = parity.createIntent(s, now, { missedMove:true, hadFirstTouch:!!s.hadFirstTouch, qty:num(s.position)/num(s.entry) });
           s.paperState = 'WAITING_ENTRY'; s.displayState = 'WAITING_ENTRY'; s.status = 'DETECTED'; s.positionStatus = 'NONE'; s.entryHit = false;
           s.stateReason = `${V4_VERSION}: execution parity withheld missed-move order; no simulated fill`;
-          parity.appendEvent(s, 'ORDER_WITHHELD', now, { reason:s.executionIntent.reason, observedPrice:price });
+          recordWithhold24(s,'MISSED_MOVE_LIVE_PARITY',now,price);
+          observeDecision24(s,'ORDER_WITHHELD','MISSED_MOVE_LIVE_PARITY',now,market);
           changed = true;
           continue;
         }
+      if (timing.inZone && timing.directional) {
         // fix49h(H1): ACTIVE must mean FILLED. A real GTC limit is resting at entry on Bybit —
         // the exchange decides the fill, not paper timing. Without this gate, missed-move and
         // zone-touch activation marked signals ACTIVE that Bybit never filled (paper booked
@@ -6937,7 +6803,10 @@ function updateExistingSignals(signals, priceMap) {
         // Instead of activating into it, revert to WAITING_ENTRY and let it re-confirm on a genuine pullback.
         // The hard-cap (item 3) still governs total waiting time, so it cannot loop forever.
         if (_activationTimingScore >= 100) {
-          if (s.paperState !== 'WAITING_ENTRY') changed = true;
+          changed = true;
+          s.timingHoldCount=num(s.timingHoldCount)+1;
+          recordWithhold24(s,'ENTRY_TIMING_TOO_HIGH',now,price);
+          observeDecision24(s,'TIMING_HOLD','ENTRY_TIMING_TOO_HIGH',now,market);
           s.paperState = 'WAITING_ENTRY';
           s.displayState = 'WAITING_ENTRY';
           s.status = 'DETECTED';
@@ -6956,13 +6825,16 @@ function updateExistingSignals(signals, priceMap) {
         // Tunable/disable-able via env without a redeploy of logic: V4_TIMING_BLOCK_THRESHOLD (default 44; set 999 to disable).
         const _timingBlockAt = Math.max(1, Number(process.env.V4_TIMING_BLOCK_THRESHOLD || '44'));
         if (_activationTimingScore >= _timingBlockAt) {
-          if (s.paperState !== 'WAITING_ENTRY') changed = true;
+          changed = true;
+          s.timingHoldCount=num(s.timingHoldCount)+1;
+          recordWithhold24(s,'ENTRY_TIMING_TOO_HIGH',now,price);
+          observeDecision24(s,'TIMING_HOLD','ENTRY_TIMING_TOO_HIGH',now,market);
           s.paperState = 'WAITING_ENTRY';
           s.displayState = 'WAITING_ENTRY';
           s.status = 'DETECTED';
           s.positionStatus = 'NONE';
           s.entryTimingScore = _activationTimingScore;
-          s.stateReason = `${V4_VERSION}: ENTRY_TIMING=${_activationTimingScore} >= ${_timingBlockAt} (late-confirm net-negative band) — held in WAITING, not activated`;
+          s.stateReason = `${V4_VERSION}: ENTRY_TIMING=${_activationTimingScore} >= ${_timingBlockAt} (timing-score policy hold; not a latency measurement) — held in WAITING, not activated`;
           appendSignalDiagnostic('ENTRY_TIMING_TOO_HIGH', s, { prevState, price, timing, timingScore: _activationTimingScore, threshold: _timingBlockAt }, settings);
           continue;
         }
@@ -7069,59 +6941,23 @@ function updateExistingSignals(signals, priceMap) {
         }
         const parity = require('./executionParity');
         const _qty = num(s.position) > 0 && num(s.entry) > 0 ? num(s.position) / num(s.entry) : num(s.qty);
-        const _activeCount = signals.filter(x => x && x.id !== s.id && x.paperState === 'PAPER_ACTIVE').length;
-        const _eligibility = decideLiveEntry(s, market, timing, settings, atr, _activeCount);
+        const _activeCount = signals.filter(x => x && x.id !== s.id && (x.paperState === 'PAPER_ACTIVE' || paperOrders.working(x.executionPosition))).length;
+        const _eligibility = passesScoreBand(s.score) ? decideLiveEntry(s, market, timing, settings, atr, _activeCount) : {wouldPlace:false,reason:scoreBandReason(s.score)};
         // decideLiveEntry is the single authority for first-touch/retest and every
         // other normalized gate. Do not apply a second, divergent retest rule here.
         const _intent = parity.createIntent(s, now, { missedMove:false, hadFirstTouch:!!s.hadFirstTouch, requireRetest:false, qty:_qty, eligibility:_eligibility });
         if (_intent.status !== 'ACCEPTED') {
           s.executionIntent = _intent; s.paperState='REJECTED'; s.displayState='REJECTED'; s.status='REJECTED'; s.positionStatus='NONE'; s.entryHit=false; s.closedAt=now;
-          parity.appendEvent(s,'ORDER_REJECTED',now,{reason:_intent.reason,observedPrice:price}); changed=true; continue;
+          parity.appendEvent(s,'ORDER_REJECTED',now,{reason:_intent.reason,observedPrice:price}); observeDecision24(s,'ORDER_REJECTED',_intent.reason,now,market); changed=true; continue;
         }
-        const _position = s.executionPosition && ['PENDING_ACK','PENDING_FILL'].includes(s.executionPosition.status)
-          ? s.executionPosition : parity.newPosition(_intent);
-        try {
-          if (_position.status === 'PENDING_ACK') {
-            parity.acknowledgeOrder(_position, { at:now, orderId:`paper_${_intent.intentId}` });
-            s.executionIntent=_intent; s.executionPosition=_position; s.paperState='WAITING_ENTRY'; s.displayState='PAPER_PENDING_FILL';
-            s.status='DETECTED'; s.positionStatus='NONE'; s.entryHit=false;
-            parity.appendEvent(s,'PAPER_ORDER_ACK',now,{limitPrice:_intent.plannedEntry});
-            changed=true; continue;
-          }
-          const _limitTouched = _intent.side === 'BUY' ? price <= _intent.plannedEntry : price >= _intent.plannedEntry;
-          if (!_limitTouched || now <= num(_position.acknowledgedAt)) {
-            s.executionIntent=_intent; s.executionPosition=_position; s.paperState='WAITING_ENTRY'; s.displayState='PAPER_PENDING_FILL';
-            s.status='DETECTED'; s.positionStatus='NONE'; s.entryHit=false; changed=true; continue;
-          }
-          const _fillPrice = _intent.side === 'BUY' ? Math.min(price,_intent.plannedEntry) : Math.max(price,_intent.plannedEntry);
-          parity.applyFill(_position, { at:now, price:_fillPrice, qty:_qty, fee:FEE_RATE*_qty*_fillPrice, liquidity:'SIMULATED_LIMIT', execId:`paper_${_intent.intentId}_${now}` });
-        } catch (_fillErr) {
-          s.executionIntent=_intent; s.executionPosition=_position; s.paperState='REJECTED'; s.displayState='REJECTED'; s.status='REJECTED'; s.positionStatus='NONE'; s.entryHit=false; s.closedAt=now;
-          parity.appendEvent(s,'FILL_REJECTED',now,{reason:_fillErr.message,observedPrice:price}); changed=true; continue;
-        }
-        s.executionIntent = _intent;
-        s.executionPosition = _position;
-        s.avgFillPrice = _position.avgFillPrice;
-        s.paperState = 'PAPER_ACTIVE';
-        s.status = 'ACTIVE';
-        s.displayState = 'PAPER_ACTIVE';
-        s.positionStatus = 'PAPER';
-        s.entryHit = true;
-        s.openedAt = now;
-        s.entryTimingScore = _activationTimingScore; // fix48d (item 5): real value, every activated trade
-        // fix48d: initialise rich excursion/regime path tracking for adaptive analysis (no gating)
-        initActiveDiagnostics(s, price, atr, now, settings);
-        // Patch 2.1 observability: keep signal timing commentary separate from the
-        // execution fact that actually authorized PAPER_ACTIVE. No trading behavior changes.
-        s.timingReason = `${V4_VERSION}: ` + timing.reason;
-        s.executionReason = `${V4_VERSION}: PAPER_LIMIT_FILL_CONFIRMED — accepted intent, order acknowledged, eligible limit touch, fill applied`;
-        // Preserve the legacy stateReason for UI/backward compatibility; executionReason is
-        // the authoritative execution audit field.
-        s.stateReason = `${V4_VERSION}: ` + timing.reason;
-        s.history = [...(s.history || []), { at: now, state: 'PAPER_ACTIVE', reason: s.stateReason, timingReason:s.timingReason, executionReason:s.executionReason, price, plannedEntry:s.plannedEntry, avgFillPrice:s.avgFillPrice, filledQty:_position.filledQty, intentId:_intent.intentId, acknowledgedAt:_position.acknowledgedAt }];
-        appendSignalDiagnostic('TRADE_ACTIVATED', s, { prevState, price, timing }, settings);
-        changed = true;
-        // fixORTRIGGER (4.6.9.1): FARTCOIN/AAVE/NEAR proof (07/29 chat, real ledger evidence, 3 confirmed
+        const _position = parity.newPosition(_intent);
+        parity.acknowledgeOrder(_position,{at:now,orderId:'paper_'+_intent.intentId});
+        s.executionIntent=_intent;s.executionPosition=_position;
+        s.paperState='WAITING_ENTRY';s.displayState='PAPER_PENDING_FILL';s.status='DETECTED';s.positionStatus='NONE';s.entryHit=false;
+        s.entryTimingScore=_activationTimingScore;s.timingReason=timing.reason;
+        s.executionReason='PATCH-2.4: accepted and acknowledged; awaiting later fresh limit retrace';
+        changed=true;continue;
+        // fixORTRIGGER        // fixORTRIGGER (4.6.9.1): FARTCOIN/AAVE/NEAR proof (07/29 chat, real ledger evidence, 3 confirmed
         // instances) — paper activates HERE the moment timing.directional confirms, first touch or
         // second, no hadFirstTouch requirement. The live hook right below required s.hadFirstTouch
         // specifically (a genuine SECOND touch) — so a signal confirmed only on its FIRST touch
@@ -7465,6 +7301,11 @@ function updateExistingSignals(signals, priceMap) {
     for (const _c of _flipChildren) signals.push(_c);
     changed = true;
   }
+  for(const row of signals){
+    if(row.entryHit)observations.link(row);
+    else if(FINAL_STATES.has(row.paperState))observeDecision24(row,row.paperState,row.stateReason||row.paperState,row.closedAt||now,priceMap.get(row.sym||row.symbol)||{});
+  }
+  observations.flush();
   return changed;
 }
 
@@ -8017,6 +7858,7 @@ async function scanOnce() {
         }
         const built = buildStructurePlan(ctx, settings, btcRegime);
         if (!built.ok) {
+          if(built.leader?.side && built.leader.side!=='NEU')observeDecision24({...built.leader,price:t.lastPrice},'PRE_PLAN_REJECTED',built.reason,Date.now(),t);
           entries.push({ symbol: t.symbol, side: built.leader?.side || 'NEU', score: 0, rejected: true, rejectReasons: [built.reason], price: roundPrice(t.lastPrice) });
           continue;
         }
@@ -8047,8 +7889,11 @@ async function scanOnce() {
         // fix44a had removed this entirely → 0 retry signals all session
         // fix44d restored it but missed MAX_OPEN_TRADES_REACHED (set after gate check)
         // fix44e: single write point covers all rejection paths, keyed map = no dupes
-        const _isRejected = !gate.ok || (gate.ok && openSignalCount(signals) >= settings.maxOpenTrades);
+        reconcileScoreAdmission(leader,gate);
+        appendDiagnosticJournal({at:Date.now(),type:'FINAL_ADMISSION_DECISION',version:V4_VERSION,symbol:leader.symbol,side:leader.side,scoreAdmission:leader.scoreAdmission,marketPermission:leader.marketPermission,gate},settings);
+        const _isRejected = !gate.ok;
         if (_isRejected) {
+          observeDecision24({...leader,atr:leader.keyLevels?.atr},'PRE_ADMISSION_REJECTED',JSON.stringify(leader.rejectReasons||gate.reasons||[]),Date.now(),priceMap.get(leader.symbol)||{});
           const _rejKey = `${leader.symbol}_${leader.side}`;
           const _rejReasons = leader.rejectReasons || [];
           const _isHard = _rejReasons.some(rs => HARD_REJECT_PREFIXES.some(p => String(rs).startsWith(p)));
@@ -8329,52 +8174,9 @@ function ingestCandidate(payload = {}) {
   const minScore = minScoreForSide(side, settings);
   const minRR = minRRFor(side, settings); // fix47: always Math.max(2.0, configValue) — no score tier
 
-  // fix48i: mirror the narrow sentinel side-block here (ingestCandidate is the second entry path).
-  // Same strict guards: only blocks when sentinel is FRESH, READY, in a clear directional regime,
-  // and has removed this side. Self-disables if sentinel stale. No gate inflation.
-  try {
-    const _sent = sentinel.getSentinel();
-    const _sentReady = _sent && _sent.market_regime !== 'UNKNOWN';
-    const _sentAge = _sent && _sent.updatedAt ? Date.now() - _sent.updatedAt : Infinity;
-    const _sentFresh = _sentAge <= 5 * 60 * 1000;
-    const _sentAllowed = Array.isArray(_sent && _sent.allowed_sides) ? _sent.allowed_sides.map(x => String(x).toUpperCase()) : null;
-    const _clear = ['STRONG_BULL', 'BULL', 'STRONG_BEAR', 'BEAR'].includes(String(_sent && _sent.market_regime || '').toUpperCase());
-    if (_sentReady && _sentFresh && _clear && Array.isArray(_sentAllowed) && _sentAllowed.length > 0 && !_sentAllowed.includes(side)) {
-      // fix49k: breadth-override supersedes this gate too (mirror of planner path) — full allowed.
-      if (breadthOverrideSide(side, btcRegime, settings) === side) {
-        warnings.push(`BREADTH_OVERRIDE_${side}_BEATS_SENTINEL_BLOCK_regime=${_sent.market_regime}`);
-      } else {
-        reasons.push(`SENTINEL_SIDE_BLOCKED_${side}_regime=${_sent.market_regime}`);
-      }
-    }
-  } catch (_e) { /* sentinel unavailable — do not block */ }
-
-  // fix49h(H2): mirror the breadth-fighting gate here — ingestCandidate is the second entry path
-  // (retry signals). Same thresholds, same graded design, same fail-open rules as shouldReject.
-  // Without this mirror a retry would replay a breadth-fighting setup straight past the gate
-  // (same class of leak as the fix48q retry score-floor bypass).
-  try {
-    const { sent: _bSent, stale: _bStale, ageMs: _bAgeMs } = getSentinelForCapture();
-    const _bPairs = num(_bSent?.vol?.pair_count, 0);
-    const _bPct = _bPairs > 0 ? num(_bSent?.vol?.bull_pct, NaN) : NaN;
-    if (Number.isFinite(_bPct) && (!_bStale || _bAgeMs <= 30 * 60 * 1000)) {
-      // fix49o: mirrored 30/70 -> 50/50, same rationale as the planner-path copy above. Kept
-      // identical to that block deliberately — these two sites must move together or they silently
-      // diverge (flagged in the fix49n sweep as a known duplication risk; full merge deferred to a
-      // dedicated refactor, not bundled into this threshold change).
-      const BUY_MIN_BREADTH  = Math.max(0, Math.min(50, Number(process.env.V4_BUY_MIN_BREADTH  || '50')));
-      const SELL_MAX_BREADTH = Math.max(50, Math.min(100, Number(process.env.V4_SELL_MAX_BREADTH || '50')));
-      if (side === 'BUY') {
-        if (_bPct <= BUY_MIN_BREADTH) reasons.push(`BREADTH_FIGHT_BUY_${_bPct.toFixed(0)}PCT_LE_${BUY_MIN_BREADTH}`);
-        else if (_bPct <= 65) warnings.push(`BREADTH_SOFT_BUY_${_bPct.toFixed(0)}PCT`);
-      } else if (side === 'SELL') {
-        if (_bPct >= SELL_MAX_BREADTH) reasons.push(`BREADTH_FIGHT_SELL_${_bPct.toFixed(0)}PCT_GE_${SELL_MAX_BREADTH}`);
-        else if (_bPct >= 35) warnings.push(`BREADTH_SOFT_SELL_${_bPct.toFixed(0)}PCT`);
-      }
-    } else {
-      warnings.push('BREADTH_UNAVAILABLE_NO_GATE');
-    }
-  } catch (_e) { warnings.push('BREADTH_GATE_ERROR_NO_GATE'); }
+  const marketPermission=currentMarketPermission();
+  if(!marketPolicy.allows(marketPermission,side))reasons.push('BREADTH_SIDE_BLOCKED_'+side);
+  warnings.push(marketPermission.reason);
 
   const slPct = entry && sl ? Math.abs(entry - sl) / Math.abs(entry) * 100 : 0;
   const minSlPct = Math.max(0, num(settings.minSlDistancePct, MIN_SL_DISTANCE_PCT));
@@ -8482,6 +8284,7 @@ function ingestCandidate(payload = {}) {
   if (!waitingDuplicate && openSignalCount(signals) >= settings.maxOpenTrades) reasons.push('MAX_OPEN_TRADES_REACHED');
 
   const rejected = reasons.length > 0;
+  if(rejected)observeDecision24({symbol,side,entry,sl,tp1,atr:atrForGate,score,price:payload.price,marketPermission,rejectReasons:reasons},'PRE_ADMISSION_REJECTED',JSON.stringify(reasons),Date.now(),payload);
   if (rejected) {
     addLog('V4_CANDIDATE_REJECTED', `${symbol || 'UNKNOWN'} ${side || 'NEU'} ${reasons.slice(0,3).join(',')}`, {score, rr, slPct, btcRegime, warnings});
     // fix44a: skip alert store write removed
@@ -8500,6 +8303,7 @@ function ingestCandidate(payload = {}) {
   const netSl = -(grossSl + feeEst);
   const netRr = Math.abs(netSl) ? Math.max(0, netTp) / Math.abs(netSl) : 0;
   const sig = {
+    marketPermission,priceAtBirth:num(payload.price,NaN),scoreAdmission:{raw:score,adjusted:score,final:score,policy:{minInclusive:40,maxExclusive:80},pass:passesScoreBand(score)},
     id: `v4c_${symbol}_${side}_${now}`,
     source: payload.source || `backend-retry-${V4_VERSION}`, // fix47: use caller's source — never default to frontend label
     plannerVersion: V4_VERSION,
@@ -8881,6 +8685,14 @@ function cancelSignal({ id = '', signalId = '', symbol = '', side = '', reason =
     // Still refuse to re-touch a properly-terminal (FINAL) signal.
     const _isOrphan = !ACTIVE_STATES.has(s.paperState) && !FINAL_STATES.has(s.paperState);
     if (!ACTIVE_STATES.has(s.paperState) && !_isOrphan) return s;
+    if(!s.tradeId&&!s.liveOrderId&&s.executionPosition){
+      paperOrders.cancel(s.executionPosition,now,reason);
+      if(s.executionPosition.remainingQty>0){
+        s.paperState='PAPER_ACTIVE';s.displayState='PAPER_ACTIVE';s.status='ACTIVE';s.positionStatus='PAPER';
+        s.stateReason='Remainder cancelled; filled position remains open';
+        changed=true;cancelled.push(s);return s;
+      }
+    }
     const next = {
       ...s,
       paperState: 'INVALIDATED',
@@ -9035,6 +8847,11 @@ async function manualRetryRejections({ maxAgeMinutes = 240, minScore = 60 } = {}
 }
 
 module.exports = {
+  refreshSignalPlan, reconcileOrphanedLedgerRows,
+  buildStructurePlan, convictionScore, signalFromLeader, applyPerCoinTrend, btcRegimeDecision,
+  updateExistingSignals, signalEntryTiming, deriveEntryTimingScore, timingDiagnostics24, revalidateWaitingSignal,
+  currentMarketPermission, reconcileScoreAdmission, shouldReject, saveSignals,
+  getRejectedObservations:observations.snapshot,
   V4_VERSION, // fix48u: export so /health + /api/v4/status report the live code version
   // fixPROOF: verifiable exports so /health can confirm the memory fixes are actually the
   // running code, not just present in a committed file. getKlineCacheStats existing at all
@@ -9042,7 +8859,7 @@ module.exports = {
   getKlineCacheStats: () => ({ size: _klineCache.size, cap: KLINE_CACHE_MAX }),
   MAX_LEDGER_ACTIVE: MAX_LEDGER,
   RISK_DEFAULT_ACTIVE: 0.25, // fixSIZECAP: proves the risk-per-trade default fix is loaded
-  getConfigFlags: () => ({ FIXCONFIRM_ENTRY_MARKET, fixRetestEnabled: true, restingWatchMs: RESTING_WATCH_MS, ledgerObservabilitySchema: LEDGER_OBSERVABILITY_SCHEMA }), // fixVERIFY (07/26): lets /health report the live value of entry-placement flags directly from the running process, so a deploy can be confirmed correct with zero live trades — needed because these hooks only fire when tradingEnabled=true, so logs alone can't verify a dry/warmup run.
+  getConfigFlags: () => ({ FIXCONFIRM_ENTRY_MARKET, patchVersion:'PATCH-2.4', sourceHash:patch24Identity.sourceHash, sourceHashes:patch24Identity.sourceHashes, marketPolicy:marketPolicy.VERSION, scorePolicy:{minInclusive:40,maxExclusive:80}, timingBlockThreshold:Number(process.env.V4_TIMING_BLOCK_THRESHOLD||44), maxPriceAgeMs:paperOrders.MAX_PRICE_AGE_MS, fixRetestEnabled: true, restingWatchMs: RESTING_WATCH_MS, ledgerObservabilitySchema: LEDGER_OBSERVABILITY_SCHEMA }), // fixVERIFY (07/26): lets /health report the live value of entry-placement flags directly from the running process, so a deploy can be confirmed correct with zero live trades — needed because these hooks only fire when tradingEnabled=true, so logs alone can't verify a dry/warmup run.
   getLedgerReconcileStats, // fix49s: zombie-reconcile heartbeat — lastAt/totalReconciled for /health
   start,
   stop,
