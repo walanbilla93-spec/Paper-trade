@@ -332,6 +332,11 @@ router.post('/clear-ledger', auth, (req, res) => {
   catch(e){ res.status(e.code==='LEDGER_CLEAR_BLOCKED'?409:500).json({ok:false,error:e.message,unresolved:e.unresolved||[]}); }
 });
 
+router.post('/clear-research-history', auth, (req, res) => {
+  try { res.json(v4.clearResearchHistory({ reason: req.body?.reason || 'DAY_ZERO_RESEARCH_RESET' })); }
+  catch (e) { res.status(e.code==='RESEARCH_HISTORY_CLEAR_BLOCKED'?409:500).json({ ok:false, error:e.message, code:e.code||'RESEARCH_HISTORY_CLEAR_FAILED' }); }
+});
+
 router.post('/new-session', auth, (req, res) => {
   try { res.json(v4.startNewSession({ archive: req.body?.archive !== false, reason:'API_NEW_SESSION' })); }
   catch(e){ res.status(500).json({ok:false,error:e.message}); }
