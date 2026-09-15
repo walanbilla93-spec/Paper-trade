@@ -966,12 +966,13 @@ body { padding-bottom: var(--nav-h); }
          between, which is exactly where the staleness kept creeping in. Unlike the older
          History CSV button, failures are shown, not swallowed silently. -->
     <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-      <button onclick="orayanDownloadLedger()" id="dlLedgerBtn" style="font-family:'JetBrains Mono',monospace;font-size:9px;background:none;border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:4px;cursor:pointer">⬇ Download Ledger (JSON)</button>
+      <button onclick="orayanDownloadLedger()" id="dlLedgerBtn" style="font-family:'JetBrains Mono',monospace;font-size:9px;background:none;border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:4px;cursor:pointer">⬇ Trade Journal + Rejected Observations (JSON)</button>
       <button onclick="orayanDownloadBreadthHistory()" id="dlBreadthBtn" style="font-family:'JetBrains Mono',monospace;font-size:9px;background:none;border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:4px;cursor:pointer">⬇ Download Breadth History (JSON)</button>
       <button onclick="orayanDownloadBybitLedger()" id="dlBybitBtn" style="font-family:'JetBrains Mono',monospace;font-size:9px;background:none;border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:4px;cursor:pointer">⬇ Bybit Ledger (JSON)</button>
       <button onclick="orayanDownloadShadowSignals()" id="dlShadowSignalsBtn" style="font-family:'JetBrains Mono',monospace;font-size:9px;background:none;border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:4px;cursor:pointer">⬇ Shadow Signals (CSV)</button>
       <button onclick="orayanDownloadShadowDiag()" id="dlShadowDiagBtn" style="font-family:'JetBrains Mono',monospace;font-size:9px;background:none;border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:4px;cursor:pointer">⬇ Shadow Diag (CSV)</button>
       <button onclick="orayanDownloadPhaseTrace()" id="dlPhaseTraceBtn" style="font-family:'JetBrains Mono',monospace;font-size:9px;background:none;border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:4px;cursor:pointer">⬇ Phase Trace (CSV)</button>
+      <span style="font-size:10px;color:var(--dim)">Includes 5m–4h rejected-setup price observations; excluded from trade P&amp;L.</span>
       <span id="journalDownloadStatus" style="font-family:'JetBrains Mono',monospace;font-size:8px;color:var(--dim);align-self:center"></span>
     </div>
     <!-- fix58: Bybit ground-truth summary — real WR/P&L AFTER fees + slippage, computed client-side
