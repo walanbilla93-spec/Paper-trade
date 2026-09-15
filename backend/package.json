@@ -1,11 +1,12 @@
 {
   "name": "orayan-backend",
   "version": "1.0.0",
-  "description": "Orayan Hunter backend \u2014 Bybit proxy + journal/signal/trade persistence + background scanner",
+  "description": "Orayan Hunter backend — Bybit proxy + journal/signal/trade persistence + background scanner",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node ../tests/run-patch24.js"
   },
   "dependencies": {
     "axios": "^1.6.8",
