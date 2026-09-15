@@ -8441,11 +8441,7 @@ window.switchTab = function(tab) {
       const body=$('signalsBody'); if(!body) return;
       const tableWrap = body.closest('div');
       const keepScrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
-      // Patch 2.4.1b: Signals is the CURRENT SESSION/ACTIVE QUEUE view.
-      // Ledger history is intentionally preserved by New Session and belongs in Journal.
-      // Using state.rows here merged the preserved ledger back into Signals immediately after
-      // a successful /new-session call, making the button look like a no-op (e.g. 43 -> 43).
-      const rowsAll = Array.isArray(state.snapshot?.signals) ? state.snapshot.signals : [];
+      const rowsAll=(state.rows && state.rows.length) ? state.rows : ((window.__orayanV4Rows && window.__orayanV4Rows.length) ? window.__orayanV4Rows : (state.snapshot ? normalizeRows(state.snapshot) : []));
       const sum=summary(rowsAll);
       const activeCount = rowsAll.filter(r=>isActive(r)).length;
       const invalidCount = rowsAll.filter(r=>isInv(r)).length;
@@ -9125,6 +9121,19 @@ window.switchTab = function(tab) {
       pushAlert(wantLedger?'Ledger cleared':'Session cleared',
         `archived=${j.archived??0} · ledger rows now ${j.ledgerTotal??'?'}${j.ledgerCleared?' · durable ledger wiped':' · history kept'}${j.carried?` · ${j.carried} open carried`:''}`,
         {key:'clear_ok_'+Date.now()});
+      if(wantLedger && j.ledgerCleared===true && confirm('Ledger is clear. Also clear OLD rejected-opportunity research history to start a compact Day Zero export?\n\nThis does NOT clear ledger/trades/signals.')){
+        const rr=await fetch(url+'/api/v4/clear-research-history',{
+          method:'POST',headers:postHeaders(),
+          body:JSON.stringify({reason:'DAY_ZERO_RESEARCH_RESET'}),
+          signal:AbortSignal.timeout(12000)
+        });
+        let rj={}; try{rj=await rr.json();}catch(_e){}
+        if(!rr.ok || rj.ok===false){
+          pushAlert('Research-history clear failed',rj.error||('HTTP '+rr.status),{key:'research_clear_fail_'+Date.now(),important:true});
+        }else{
+          pushAlert('Research history cleared',`removed ${rj.cleared??0} stale observation rows · ledger preserved`,{key:'research_clear_ok_'+Date.now()});
+        }
+      }
       return true;
     }catch(e){
       pushAlert('Backend clear failed', e.name==='TimeoutError'?'Request timed out after 12s — backend may be asleep or unreachable.':e.message,
