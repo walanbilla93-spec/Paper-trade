@@ -8441,7 +8441,11 @@ window.switchTab = function(tab) {
       const body=$('signalsBody'); if(!body) return;
       const tableWrap = body.closest('div');
       const keepScrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
-      const rowsAll=(state.rows && state.rows.length) ? state.rows : ((window.__orayanV4Rows && window.__orayanV4Rows.length) ? window.__orayanV4Rows : (state.snapshot ? normalizeRows(state.snapshot) : []));
+      // Patch 2.4.1b: Signals is the CURRENT SESSION/ACTIVE QUEUE view.
+      // Ledger history is intentionally preserved by New Session and belongs in Journal.
+      // Using state.rows here merged the preserved ledger back into Signals immediately after
+      // a successful /new-session call, making the button look like a no-op (e.g. 43 -> 43).
+      const rowsAll = Array.isArray(state.snapshot?.signals) ? state.snapshot.signals : [];
       const sum=summary(rowsAll);
       const activeCount = rowsAll.filter(r=>isActive(r)).length;
       const invalidCount = rowsAll.filter(r=>isInv(r)).length;
