@@ -4438,36 +4438,7 @@ function saveSignals(signals) {
     const _prev = store.read('v4_signals', []);
     if (Array.isArray(_prev)) _prevById = new Map(_prev.filter(p => p && p.id).map(p => [p.id, p]));
   } catch (_e) { /* store unreadable — write what we have */ }
-  let _incoming = signals || [];
-
-  // Patch 2.4.1c — session-boundary stale-writer guard.
-  // scanOnce() keeps a local signals array across awaits. A New Session can commit a new
-  // v4_session_state + saveSignals(carry) while that scan is still in flight; when the old scan
-  // later reaches saveSignals(), its pre-boundary array used to resurrect the just-cleared rows.
-  // Reject rows belonging to an older session unless they carry unresolved execution authority.
-  // This preserves the Patch 2.4.1 rule that real/acknowledged orders survive session boundaries.
-  try {
-    const _sessionNow = getSessionState();
-    const _sessionStartedAt = num(_sessionNow?.startedAt, 0);
-    _incoming = _incoming.filter(s => {
-      if (!s) return false;
-      const _orderBearing = !!(
-        s.tradeId || s.liveOrderId || s.orderId || s.orderClaimAt ||
-        s.paperState === 'PAPER_ACTIVE' ||
-        paperOrders.working(s.executionPosition) ||
-        num(s.executionPosition?.filledQty, 0) > 0
-      );
-      if (_orderBearing) return true;
-      if (s.sessionId) return s.sessionId === _sessionNow.id;
-      // Legacy/no-session rows are allowed only if born after the current boundary.
-      return num(s.createdAt, 0) >= _sessionStartedAt;
-    });
-  } catch (_sessionGuardErr) {
-    // Fail closed for the mutation: if session authority cannot be read, do not overwrite the
-    // durable signal queue with a potentially stale scan snapshot.
-    return;
-  }
-
+  const _incoming = signals || [];
   if (_prevById) {
     for (const s of _incoming) {
       if (!s || !s.id) continue;
@@ -8870,6 +8841,23 @@ function startNewSession({archive=true,reason='NEW_SESSION'}={}) {
   return {ok:true,archived:archive&&signals.length?1:0,cleared:signals.length-carry.length,carried:carry.length,ledgerTotal:ledger.length,ledgerCleared:false,historyPreserved:true,session};
 }
 
+
+function clearResearchHistory({ reason = 'MANUAL_RESEARCH_RESET' } = {}) {
+  const signals=getSignals();
+  const unresolved=signals.filter(s => s && (
+    s.tradeId || s.liveOrderId || s.paperState === 'PAPER_ACTIVE' ||
+    paperOrders.working(s.executionPosition) || num(s.executionPosition?.filledQty,0) > 0
+  ));
+  if(unresolved.length){
+    const err=new Error(`RESEARCH_HISTORY_CLEAR_BLOCKED_UNRESOLVED_POSITIONS_${unresolved.length}`);
+    err.code='RESEARCH_HISTORY_CLEAR_BLOCKED';
+    throw err;
+  }
+  const result=observations.clearResearchHistory(reason);
+  addLog('V4_RESEARCH_HISTORY_CLEARED', `Rejected-opportunity research history cleared (${result.cleared})`, {reason});
+  return {...result, ledgerPreserved:true, signalsPreserved:true};
+}
+
 function freshJournal() {
   return startNewSession({archive:true,reason:'FRESH_JOURNAL_COMPAT'});
 }
@@ -8930,6 +8918,7 @@ module.exports = {
   updateExistingSignals, signalEntryTiming, deriveEntryTimingScore, timingDiagnostics24, revalidateWaitingSignal,
   currentMarketPermission, reconcileScoreAdmission, shouldReject, saveSignals,
   getRejectedObservations:observations.snapshot,
+  clearResearchHistory,
   V4_VERSION, // fix48u: export so /health + /api/v4/status report the live code version
   // fixPROOF: verifiable exports so /health can confirm the memory fixes are actually the
   // running code, not just present in a committed file. getKlineCacheStats existing at all

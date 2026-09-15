@@ -104,4 +104,15 @@ function observe(priceMap,now=Date.now()){return safely(()=>{
 });}
 function link(s){return safely(()=>{let changed=false;for(const r of load().rows)if(r.candidateId===s.id){r.actualTradeLinked={signalId:s.id,intentId:s.executionPosition?.intent?.intentId||null,tradeId:s.tradeId||null,at:s.openedAt||null};changed=true;}if(changed)save();});}
 function snapshot(){return clone({...load(),enabled:enabled(),horizonsMinutes:HORIZONS,toleranceMs:TOLERANCE_MS,capacity:CAP});}
-module.exports={SCHEMA,register,observe,link,snapshot,flush:()=>safely(save),_resetForTests:()=>{state=undefined;}};
+function clearResearchHistory(reason='MANUAL_RESEARCH_RESET'){
+  const now=Date.now(), previous=load(), previousRows=previous.rows.length;
+  state={schema:SCHEMA,rows:[],health:{
+    dropped:0,writeFailures:0,invalidSamples:0,evictedCensored:0,
+    resetAt:now,resetReason:String(reason||'MANUAL_RESEARCH_RESET'),previousRows
+  }};
+  save();
+  const disk=store.read('v4_rejected_observations',null);
+  if(!disk || !Array.isArray(disk.rows) || disk.rows.length!==0)throw new Error('RESEARCH_HISTORY_CLEAR_DURABILITY_VERIFY_FAILED');
+  return {ok:true,cleared:previousRows,total:0,resetAt:now,reason:state.health.resetReason};
+}
+module.exports={SCHEMA,register,observe,link,snapshot,clearResearchHistory,flush:()=>safely(save),_resetForTests:()=>{state=undefined;}};
