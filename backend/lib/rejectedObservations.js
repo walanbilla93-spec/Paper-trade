@@ -1,16 +1,37 @@
 'use strict';
 // Independent research store: no imports of order, sizing, strategy or accounting code.
 const store=require('./store'), crypto=require('crypto');
-const SCHEMA='REJECTED_OPPORTUNITY_2.4', HORIZONS=[5,15,30,60,120,240], TOLERANCE_MS=10000, CAP=2000;
+const SCHEMA='REJECTED_OPPORTUNITY_2.4.1', HORIZONS=[5,15,30,60,120,240], TOLERANCE_MS=10000, CAP=2000;
 const clone=x=>JSON.parse(JSON.stringify(x));
 const hash=x=>crypto.createHash('sha256').update(JSON.stringify(x)).digest('hex').slice(0,24);
 const finite=x=>x!=null && Number.isFinite(Number(x)) ? Number(x) : null;
 let state;
-function load(){return state||(state=store.read('v4_rejected_observations',{schema:SCHEMA,rows:[],health:{dropped:0,writeFailures:0,invalidSamples:0}}));}
+function load(){
+  if(state)return state;
+  const raw=store.read('v4_rejected_observations',{schema:SCHEMA,rows:[],health:{}});
+  state={...raw,schema:SCHEMA,rows:Array.isArray(raw?.rows)?raw.rows:[],health:{dropped:0,writeFailures:0,invalidSamples:0,evictedCensored:0,...(raw?.health||{})}};
+  return state;
+}
 function enabled(){return process.env.V4_OBSERVATIONS_ENABLED!=='false';}
-function save(){try{store.write('v4_rejected_observations',load());load().health.lastPersistedAt=Date.now();}catch(e){load().health.writeFailures++;load().health.lastError=e.message;}}
+function save(){try{load().health.lastPersistedAt=Date.now();store.write('v4_rejected_observations',load());}catch(e){load().health.writeFailures++;load().health.lastError=e.message;}}
 function safely(fn){if(!enabled())return;try{return fn();}catch(e){load().health.lastError=e.message;}}
 function norm(v,r,atr,reference=null){return {price:v,pct:reference>0?100*v/reference:null,originalR:r>0?v/r:null,atr:atr>0?v/atr:null};}
+function activityAt(row){
+  return Math.max(0,...(row.anchors||[]).map(a=>finite(a.lastSeenAt??a.terminalAt??a.at)||0));
+}
+function makeRoom(data){
+  if(data.rows.length<CAP)return true;
+  let index=-1,oldest=Infinity;
+  for(let i=0;i<data.rows.length;i++){
+    const anchors=data.rows[i].anchors||[];
+    if(!anchors.length||anchors.some(a=>a.observationState==='RUNNING'))continue;
+    const at=activityAt(data.rows[i]);
+    if(at<oldest){oldest=at;index=i;}
+  }
+  if(index<0){data.health.dropped++;data.health.lastDropReason='CAPACITY_ALL_ROWS_RUNNING';return false;}
+  data.rows.splice(index,1);data.health.evictedCensored++;data.health.lastEvictedAt=Date.now();
+  return true;
+}
 function register(s,type,reason,at=Date.now(),market={}){return safely(()=>{
   const data=load(), plan=s.originalObservationPlan||s.plan||s;
   const originalPlan={entry:finite(plan.entry),sl:finite(plan.sl),tp:finite(plan.tp1),atr:finite(s.planner?.keyLevels?.atr ?? s.atr)};
@@ -21,12 +42,12 @@ function register(s,type,reason,at=Date.now(),market={}){return safely(()=>{
   const key=hash([candidateId,planVersion]);
   let row=data.rows.find(x=>x.id===key);
   if(!row){
-    if(data.rows.length>=CAP){data.health.dropped++;return;}
+    if(!makeRoom(data))return;
     row={id:key,schema:SCHEMA,recordType:'COUNTERFACTUAL_PRICE_PATH',accountingEligible:false,candidateId,planVersion,symbol,side,originalPlan,anchors:[],actualTradeLinked:null};
     data.rows.push(row);
   }
   let anchor=row.anchors.find(a=>a.type===type && a.reason===reason);
-  if(anchor){if(anchor.lastSeenAt!==at){anchor.count++;anchor.lastSeenAt=at;}return row.id;}
+  if(anchor){if(anchor.lastSeenAt!==at){anchor.count++;anchor.lastSeenAt=at;save();}return row.id;}
   if(row.anchors.length>=32){data.health.dropped++;row.anchorOverflow=true;return row.id;}
   const sourceAt=finite(market.sourceAt ?? s.lastPriceSourceAt), receivedAt=finite(market.receivedAt ?? s.lastPriceReceivedAt);
   const raw=finite(market.lastPrice ?? s.backendLastPrice ?? s.price);
@@ -81,6 +102,6 @@ function observe(priceMap,now=Date.now()){return safely(()=>{
   }
   save();
 });}
-function link(s){return safely(()=>{for(const r of load().rows)if(r.candidateId===s.id)r.actualTradeLinked={signalId:s.id,intentId:s.executionPosition?.intent?.intentId||null,tradeId:s.tradeId||null,at:s.openedAt||null};});}
+function link(s){return safely(()=>{let changed=false;for(const r of load().rows)if(r.candidateId===s.id){r.actualTradeLinked={signalId:s.id,intentId:s.executionPosition?.intent?.intentId||null,tradeId:s.tradeId||null,at:s.openedAt||null};changed=true;}if(changed)save();});}
 function snapshot(){return clone({...load(),enabled:enabled(),horizonsMinutes:HORIZONS,toleranceMs:TOLERANCE_MS,capacity:CAP});}
-module.exports={SCHEMA,register,observe,link,snapshot,flush:()=>safely(save)};
+module.exports={SCHEMA,register,observe,link,snapshot,flush:()=>safely(save),_resetForTests:()=>{state=undefined;}};

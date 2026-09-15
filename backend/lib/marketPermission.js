@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 'BREADTH_FIRST_2.4';
+const VERSION = 'BREADTH_FIRST_2.4.1';
 // Missing/stale breadth remains fail-open. Live sentinel-blind placement protection
 // is separate feed-health protection, not a BTC directional veto.
 function resolve({sent, now = Date.now(), buyMin = 50, sellMax = 50, maxAgeMs = 1800000} = {}) {

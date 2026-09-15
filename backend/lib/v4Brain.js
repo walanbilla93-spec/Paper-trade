@@ -148,35 +148,6 @@ const EXPIRY_MS = Math.max(5, Number(process.env.V4_SIGNAL_EXPIRY_MINUTES || pro
 // A setup that has not confirmed entry in 45 min is stale; the structure that justified it is gone.
 const WAITING_HARD_CAP_MS = Math.max(60 * 1000, Number(process.env.V4_WAITING_HARD_CAP_MINUTES || '45') * 60 * 1000);
 
-// fix49k: BREADTH-OVERRIDE (both sides, in-brain). When sentinel breadth strongly disagrees with
-// the BTC regime LABEL (the label lags because BTC carries 2× weight in the composite), trust
-// breadth over the label and rescue the breadth-aligned side that the label would otherwise block.
-//   BUY-rescue : breadth >= BREADTH_OVERRIDE_BULL_PCT (70%) AND BTC label is BEAR  → allow BUY
-//   SELL-rescue: breadth <= BREADTH_OVERRIDE_BEAR_PCT (30%) AND BTC label is BULL  → allow SELL
-// Mirror of the H2 fight-gate. Removes a safety gate on BOTH sides → paper-only until validated.
-// Default ON for paper data collection; kill via settings.breadthOverride=false (no redeploy).
-const BREADTH_OVERRIDE_ENABLED = true;            // master default; settings.breadthOverride can force false
-const BREADTH_OVERRIDE_BULL_PCT = 70;             // BUY-rescue floor (>= this % bull)
-const BREADTH_OVERRIDE_BEAR_PCT = 30;             // SELL-rescue ceiling (<= this % bull)
-
-// Returns 'BUY' | 'SELL' | null — which side (if any) breadth-override rescues right now.
-// Pure read of the current sentinel; fail-safe to null on any gap so the normal gate applies.
-function breadthOverrideSide(side, btcRegimeUpper, settings) {
-  try {
-    if (settings && settings.breadthOverride === false) return null;
-    if (!BREADTH_OVERRIDE_ENABLED) return null;
-    const s = (typeof sentinel?.getSentinel === 'function') ? sentinel.getSentinel() : null;
-    const pairs = num(s?.vol?.pair_count, 0);
-    const pct = pairs > 0 ? num(s?.vol?.bull_pct, NaN) : NaN;
-    if (!Number.isFinite(pct)) return null;
-    const reg = String(btcRegimeUpper || '').toUpperCase();
-    const isBear = ['STRONG_BEAR', 'BEAR', 'BEAR_TREND', 'BEAR_RANGE'].includes(reg);
-    const isBull = ['STRONG_BULL', 'BULL', 'BULL_TREND', 'BREAKOUT', 'BULL_RANGE'].includes(reg);
-    if (side === 'BUY'  && isBear && pct >= BREADTH_OVERRIDE_BULL_PCT) return 'BUY';
-    if (side === 'SELL' && isBull && pct <= BREADTH_OVERRIDE_BEAR_PCT) return 'SELL';
-    return null;
-  } catch (_e) { return null; }
-}
 const COOLDOWN_MS = Math.max(0, Number(process.env.V4_SYMBOL_COOLDOWN_MINUTES || process.env.COOLDOWN_MINUTES || 240)) * 60 * 1000; // fix47: removed EXPIRY_MS floor — cooldown is independent of signal expiry window
 const PUBLIC_BASE = process.env.V4_MARKET_BASE_URL || 'https://api.bybit.com';
 // ── fixHONESTPAPER (A): FEES AND SLIPPAGE RESTORED TO PAPER ────────────────────────────
@@ -197,7 +168,7 @@ const PUBLIC_BASE = process.env.V4_MARKET_BASE_URL || 'https://api.bybit.com';
 // understand that a zero-cost simulation cannot tell you whether a strategy is tradeable.
 const FEE_RATE = Math.max(0, Number(process.env.V4_FEE_RATE ?? '0.000375'));      // per side; 0.075% round trip
 const SLIPPAGE_RATE = Math.max(0, Number(process.env.V4_SLIPPAGE_RATE ?? '0.0002')); // per side; 2bp
-const V4_VERSION = '4.6.9.16-PATCH-2.4'; // NEW in .16 — hotfix42, fixPARTIALCLOSE. User's direct, correct pushback on .15: 'sometimes it reaches breakeven & then moves to TP. If we do not book any profit, that has no point. I will be left with nothing.' Breakeven-only never banks a gain — it only stops the worst case. Built the real partial close, deferred in .15 out of caution about untested live order-placement code; on reflection that caution was overstated — this codebase already places real orders successfully every trade tonight, and a reduce-only partial close is the SAME bybitPost('/v5/order/create') call with an inverted side, a fractional qty, and reduceOnly:true, not new API surface. New executor.js function placeReduceOnlyClose() mirrors executeSignal()'s exact structure (same getInstrumentInfo/floorToStep qty rounding already proven on every entry tonight, same duplicate-orderLinkId and rejection handling). SHIPPED: at +1R (V4_PARTIAL_LOCK_TRIGGER_R), banks V4_PARTIAL_LOCK_FRACTION (default 50%, clamped 10-90%) of the position at the ACTUAL price reached (not an idealized exact 1.0R — an overshoot to 1.4R banks 1.4R on the closed fraction), moves the stop to breakeven on the remainder — paper always, live for real via placeReduceOnlyClose when s.tradeId exists. The remaining fraction's netTpUSDT/netSlUSDT are scaled down to match the smaller position so a full-size number is never booked against a partial-size position; final realizedPnl is additive (banked partial + whatever the remaining fraction eventually books at TP or breakeven-SL). Live partial-close failure and the stop-move are INDEPENDENT outcomes on purpose — if the close order is rejected or the live qty can't be found, the breakeven stop move still fires, so the live position is never less protected than .15's behaviour even on a partial failure; failure is surfaced via s.partialCloseLiveFailed + a WARN log, never silent (the exact class of thing tonight's session spent hours hunting down elsewhere). 19/19 new unit tests across two harnesses (paper accounting: exact-trigger banking, real-overshoot banking not idealized-1.0R, both sides, below-trigger no-op, additive final combination both TP and breakeven-SL outcomes, fraction clamp bounds; live order construction: side inversion both directions — the single most safety-critical line in the feature — qty rounding against tonight's own real AIOUSDT/DEXEUSDT lot sizes, below-exchange-minimum fails closed rather than sending an invalid order). Full regression: 112/112 across all 10 suites from tonight's session (hotfixes 37-42 stacked in one file, nothing broken). node --check clean on 4 files. NOT yet deployed. Prior .15 — hotfix41, fixPARTIALLOCK v1 (breakeven-lock only). User witnessed the same shape 4 times TONIGHT on real money: a position reaches ~1R favorable then reverses through the bot's own unprotected stop before TP/SL fires. Quantified from tonight's 8 real Bybit closes via fixMFEALL's mfeR capture: ALL 8 reached positive mfeR (0.39R-2.66R) — entry timing ruled OUT with data, not assumed; of the 4 'wins', 3 (ERA/COTI/AIO) were only wins because the user manually intervened, so the bot's own unaided tally tonight was 1W/7L. SHIPPED: once an open position reaches +1R (V4_PARTIAL_LOCK_TRIGGER_R, default 1.0), the stop moves to exact breakeven — both paper and live (reuses fix48i-TRAIL's already-proven-live executor.setTradingStopSafe call verbatim, not new untested mechanics), only ever tightens, fires once per position. DELIBERATELY DESCOPED for tonight: does NOT yet physically bank partial size on Bybit — that needs a brand-new reduce-only live order call this codebase has never used before, and writing it untested against the real API at the end of an already-long live-money session was judged a worse risk than shipping breakeven-only now and building partial-size banking as a separately-tested follow-up. Breakeven alone already eliminates the exact failure witnessed 4 times (worst case ~$0, not a full R loss). TWO REAL BUGS FOUND AND FIXED IN REVIEW, not hypothetical: (1) netSlUSDT is computed ONCE at signal birth and never recalculated — moving the stop without fixing this would have silently booked the STALE original-distance loss instead of ~$0 on a breakeven stop-out, meaning the whole feature would have appeared to work in the logs while doing nothing to the P&L; added recomputeNetSlForMovedStop() mirroring calculatePaperMath's own formula. Same latent gap flagged (not fixed, scope discipline) in the pre-existing fix48i-TRAIL, which has the identical issue. (2) hotfix38's ledger write-skip signature didn't cover partialLockDone — caught the exact edge case where mfeR already peaked on an earlier tick, so the lock event alone wouldn't have forced a disk flush, risking the breakeven protection being lost on a crash+restart before the position resolved; added partialLockDone to the signature. 20/20 new unit tests across two harnesses (R-calc both sides + boundary, breakeven price both sides, only-tighten guard both directions, netSl recompute incl. fail-open on missing entry/position, the exact ledger-signature gap reproduced and fixed). Full regression: 93/93 across all 8 suites from tonight's session (37/38/39/40/41 stacked in one file, nothing broken). node --check clean on both files. NOT yet deployed. Prior .14 — hotfix40, fixPCTBANDSHADOW. User asked directly whether the fixPCT continuation/breakout-entry system (coinTrendEngine, live since .85-.88, still fully active: PCT_ENABLED/PCT_VOTE_ENABLED/PCT_PULLBACK_ENABLED all true) could be 'integrated' — it already is, running under everything shipped tonight. Checking the interaction surfaced something owed a clearer flag than the code comment it got in .11: fork-A's score-gate bypass (PCT_SCORE_BYPASS) matches SCORE_LT_* and has been SILENTLY DEAD since fixBAND replaced that whole reason system with SCORE_BAND_* — a strong continuation-entry leader currently gets no rescue from a band-only rejection, and nobody decided that on purpose, it was a side effect. User's call: build evidence-gathering now, decide the actual fix later. fixPCTBANDSHADOW mirrors the existing breadthFightShadow pattern exactly (same file, same author, same shape) — record-only, leader.rejected/gate.ok/rejectReasons never touched. Stamps leader.pctBandShadow (entry/sl/tp1/rr/score/coin-trend context) only when SCORE_BAND_* is the LAST barrier (mirrors fork-A's own 'only when score is the sole blocker' rule, so the eventual decision is judged on exactly the cases fork-A itself would ever be able to rescue). New PCT_SCAN counter pctBandBlocked=N, new addLog('PCT_BAND_SHADOW', ...) throttled through hotfix39's shouldLogGuard (same repeat-condition-on-same-symbol shape that caused tonight's earlier log spam), added to PHASE_LOG_TYPES so it's durable from day one. 9/9 unit tests (sole-blocker fires, band+regime-only still fires per fork-A's own rule, band+real-other-gate does NOT fire, wrong/missing continuationEntry never a candidate, withSide=false suppresses, admitted leader never fires, reason-string extraction, and a purity check proving the eval never mutates its input — matching breadthFightShadow's record-only contract). Full regression: 73/73 across 6 suites (hotfix37/38/39/40 all still green together). node --check clean on 3 files. NOT yet deployed. Prior .13 — hotfix39, fixGUARDLOG. User caught it directly from Northflank logs: BOTTOM_GUARD and PERCOIN_CONFLICT logged a fresh identical line for the SAME coin every scan tick (~20-40s) for HOURS while the condition never changed — EULUSDT/AEHRUSDT showed dozens of stacked near-duplicate lines. Found EUPH_GUARD sharing the exact same shape in the same review pass and fixed it too. IMPORTANT: only the LOG LINE is throttled — the underlying score dampening/rejection still runs and re-evaluates every tick exactly as before, so a coin's status still reacts instantly; only the disk-write/log-noise is capped, via a TIME-based per-symbol-per-guard-type cooldown (V4_GUARD_LOG_COOLDOWN_MS, default 5min) rather than a permanent once-ever suppress, since these conditions genuinely change over hours and a real re-entry deserves a fresh line. 9/9 unit tests (independent per-symbol, independent per-guard-type on the same symbol, cooldown boundary, re-entry after cooldown is NOT permanently silenced, size-cap safety valve). node --check clean. Prior .12 — hotfix38, fixLEDGERCACHE. ROOT-CAUSED the reported multi-minute UI connect stalls / red-flapping SRV / apparent Bybit wallet timeouts / growing sentinel staleness. store.read/write (lib/store.js) are fully synchronous (fs.readFileSync/writeFileSync + JSON.parse/stringify) and block Node's single event loop; upsertLedger() — a full read+merge+write of the biggest store in the system (MAX_LEDGER=5000 rows, ~9-12KB/row per hotfix9 = tens of MB at scale) — ran UNCONDITIONALLY at the end of EVERY scan cycle with no changed-gate, same disease class hotfix36 fixed for a per-candidate read, one level worse (full-ledger, every tick). Explains the wallet timeout log lines too: axios's abort timer needs a free event loop to fire, so a long sync block makes a call LOOK late even when Bybit itself wasn't. Fix: in-memory write-through cache scoped to getLedger/saveLedger only — first read/process-lifetime hits disk once, every read after is a shallow array copy from memory (verified via grep that ledger rows are only ever replaced via spread, never mutated in place, so sharing row references across cache reads is safe), writes skip disk when a structural signature (id|paperState|realizedPnl|closedAt, plus mfeR/maeR bucketed to 0.1R so fixMFEALL's excursion data still flushes periodically on an open trade rather than only at close — caught in my own review's unit tests) is unchanged from the last write; any real change always writes. sentinelBrain's separate raw read of the same file (its own staleness source) now routes through this same cache via a lazy require (avoids the circular-require v4Brain<->sentinelBrain would otherwise hit). Reversible: LEDGER_CACHE_ENABLED=false. 17/17 unit tests across two harnesses (cold-start disk hit, cache-served reads, no-op write skip, real-change write, external-mutation isolation, the mfeR/maeR durability tradeoff I caught and fixed in review, reversibility). NOT yet deployed. Prior .11 — hotfix37, three fixes in one drop. (a) fixBAND: the score QUALITY BAND 40-80 replaces hotfix33's RSI zone as the sole candidate admission rule at all 3 enforcement points; score measured by BUCKET (not linear correlation) on 167 resolved signals reads <40=27%WR n=41, 40-80=60%WR n=119, 80+=0%WR n=7 — U-shaped, which is exactly how a real signal reads as r~0 under the old linear test that produced the 'score is dead weight' rule. Validated leave-one-day-out (band wins 6/6 days) and by within-day stratified permutation (36.7pp gap, p=0.0032), with a flat plateau across floors 35-45 and ceilings 75-85 so it is not a fitted knife-edge. Replay on the 07/30-31 bleed window: -2.02U over 33 trades becomes +0.05U over 8. RSI is NOT deleted — demoted to a shadow stamp (rsiGateShadow / rsiGateShadowAtBirth) so it keeps gathering evidence. fork-A's blanket score waiver is deliberately left dormant (it would re-open the hole); fixEUPHADX's promote is rewired to the new reason string and now re-tests the restored score against the band. (b) fixARM: restingOrderWatch re-runs fixKNIFEGUARD's own candle test against an ALREADY-RESTING limit every 10s and cancels through the existing flagTradeForCancel/STALE_CANCELLED path — placement checked momentum once, the order was then exposed unchecked until fill. [Likely, NOT proven: supporting split is fills <30s 50%WR vs 30s+ 76%WR on n=65, within-day permutation p=0.19; judged by the caged session.] Does not re-arm, by design. (c) fixMFEALL: excursion capture (mfeR/maeR) only ever ran on the paper path — both live seams skipped it, so only 65 of 167 resolved rows carried it and the missing ones were the real-money trades. Pure observability, no gate reads it. Prior .10 — hotfix36 (URGENT, real regression): user reported
+const V4_VERSION = '4.6.9.17-PATCH-2.4.1'; // NEW in .16 — hotfix42, fixPARTIALCLOSE. User's direct, correct pushback on .15: 'sometimes it reaches breakeven & then moves to TP. If we do not book any profit, that has no point. I will be left with nothing.' Breakeven-only never banks a gain — it only stops the worst case. Built the real partial close, deferred in .15 out of caution about untested live order-placement code; on reflection that caution was overstated — this codebase already places real orders successfully every trade tonight, and a reduce-only partial close is the SAME bybitPost('/v5/order/create') call with an inverted side, a fractional qty, and reduceOnly:true, not new API surface. New executor.js function placeReduceOnlyClose() mirrors executeSignal()'s exact structure (same getInstrumentInfo/floorToStep qty rounding already proven on every entry tonight, same duplicate-orderLinkId and rejection handling). SHIPPED: at +1R (V4_PARTIAL_LOCK_TRIGGER_R), banks V4_PARTIAL_LOCK_FRACTION (default 50%, clamped 10-90%) of the position at the ACTUAL price reached (not an idealized exact 1.0R — an overshoot to 1.4R banks 1.4R on the closed fraction), moves the stop to breakeven on the remainder — paper always, live for real via placeReduceOnlyClose when s.tradeId exists. The remaining fraction's netTpUSDT/netSlUSDT are scaled down to match the smaller position so a full-size number is never booked against a partial-size position; final realizedPnl is additive (banked partial + whatever the remaining fraction eventually books at TP or breakeven-SL). Live partial-close failure and the stop-move are INDEPENDENT outcomes on purpose — if the close order is rejected or the live qty can't be found, the breakeven stop move still fires, so the live position is never less protected than .15's behaviour even on a partial failure; failure is surfaced via s.partialCloseLiveFailed + a WARN log, never silent (the exact class of thing tonight's session spent hours hunting down elsewhere). 19/19 new unit tests across two harnesses (paper accounting: exact-trigger banking, real-overshoot banking not idealized-1.0R, both sides, below-trigger no-op, additive final combination both TP and breakeven-SL outcomes, fraction clamp bounds; live order construction: side inversion both directions — the single most safety-critical line in the feature — qty rounding against tonight's own real AIOUSDT/DEXEUSDT lot sizes, below-exchange-minimum fails closed rather than sending an invalid order). Full regression: 112/112 across all 10 suites from tonight's session (hotfixes 37-42 stacked in one file, nothing broken). node --check clean on 4 files. NOT yet deployed. Prior .15 — hotfix41, fixPARTIALLOCK v1 (breakeven-lock only). User witnessed the same shape 4 times TONIGHT on real money: a position reaches ~1R favorable then reverses through the bot's own unprotected stop before TP/SL fires. Quantified from tonight's 8 real Bybit closes via fixMFEALL's mfeR capture: ALL 8 reached positive mfeR (0.39R-2.66R) — entry timing ruled OUT with data, not assumed; of the 4 'wins', 3 (ERA/COTI/AIO) were only wins because the user manually intervened, so the bot's own unaided tally tonight was 1W/7L. SHIPPED: once an open position reaches +1R (V4_PARTIAL_LOCK_TRIGGER_R, default 1.0), the stop moves to exact breakeven — both paper and live (reuses fix48i-TRAIL's already-proven-live executor.setTradingStopSafe call verbatim, not new untested mechanics), only ever tightens, fires once per position. DELIBERATELY DESCOPED for tonight: does NOT yet physically bank partial size on Bybit — that needs a brand-new reduce-only live order call this codebase has never used before, and writing it untested against the real API at the end of an already-long live-money session was judged a worse risk than shipping breakeven-only now and building partial-size banking as a separately-tested follow-up. Breakeven alone already eliminates the exact failure witnessed 4 times (worst case ~$0, not a full R loss). TWO REAL BUGS FOUND AND FIXED IN REVIEW, not hypothetical: (1) netSlUSDT is computed ONCE at signal birth and never recalculated — moving the stop without fixing this would have silently booked the STALE original-distance loss instead of ~$0 on a breakeven stop-out, meaning the whole feature would have appeared to work in the logs while doing nothing to the P&L; added recomputeNetSlForMovedStop() mirroring calculatePaperMath's own formula. Same latent gap flagged (not fixed, scope discipline) in the pre-existing fix48i-TRAIL, which has the identical issue. (2) hotfix38's ledger write-skip signature didn't cover partialLockDone — caught the exact edge case where mfeR already peaked on an earlier tick, so the lock event alone wouldn't have forced a disk flush, risking the breakeven protection being lost on a crash+restart before the position resolved; added partialLockDone to the signature. 20/20 new unit tests across two harnesses (R-calc both sides + boundary, breakeven price both sides, only-tighten guard both directions, netSl recompute incl. fail-open on missing entry/position, the exact ledger-signature gap reproduced and fixed). Full regression: 93/93 across all 8 suites from tonight's session (37/38/39/40/41 stacked in one file, nothing broken). node --check clean on both files. NOT yet deployed. Prior .14 — hotfix40, fixPCTBANDSHADOW. User asked directly whether the fixPCT continuation/breakout-entry system (coinTrendEngine, live since .85-.88, still fully active: PCT_ENABLED/PCT_VOTE_ENABLED/PCT_PULLBACK_ENABLED all true) could be 'integrated' — it already is, running under everything shipped tonight. Checking the interaction surfaced something owed a clearer flag than the code comment it got in .11: fork-A's score-gate bypass (PCT_SCORE_BYPASS) matches SCORE_LT_* and has been SILENTLY DEAD since fixBAND replaced that whole reason system with SCORE_BAND_* — a strong continuation-entry leader currently gets no rescue from a band-only rejection, and nobody decided that on purpose, it was a side effect. User's call: build evidence-gathering now, decide the actual fix later. fixPCTBANDSHADOW mirrors the existing breadthFightShadow pattern exactly (same file, same author, same shape) — record-only, leader.rejected/gate.ok/rejectReasons never touched. Stamps leader.pctBandShadow (entry/sl/tp1/rr/score/coin-trend context) only when SCORE_BAND_* is the LAST barrier (mirrors fork-A's own 'only when score is the sole blocker' rule, so the eventual decision is judged on exactly the cases fork-A itself would ever be able to rescue). New PCT_SCAN counter pctBandBlocked=N, new addLog('PCT_BAND_SHADOW', ...) throttled through hotfix39's shouldLogGuard (same repeat-condition-on-same-symbol shape that caused tonight's earlier log spam), added to PHASE_LOG_TYPES so it's durable from day one. 9/9 unit tests (sole-blocker fires, band+regime-only still fires per fork-A's own rule, band+real-other-gate does NOT fire, wrong/missing continuationEntry never a candidate, withSide=false suppresses, admitted leader never fires, reason-string extraction, and a purity check proving the eval never mutates its input — matching breadthFightShadow's record-only contract). Full regression: 73/73 across 6 suites (hotfix37/38/39/40 all still green together). node --check clean on 3 files. NOT yet deployed. Prior .13 — hotfix39, fixGUARDLOG. User caught it directly from Northflank logs: BOTTOM_GUARD and PERCOIN_CONFLICT logged a fresh identical line for the SAME coin every scan tick (~20-40s) for HOURS while the condition never changed — EULUSDT/AEHRUSDT showed dozens of stacked near-duplicate lines. Found EUPH_GUARD sharing the exact same shape in the same review pass and fixed it too. IMPORTANT: only the LOG LINE is throttled — the underlying score dampening/rejection still runs and re-evaluates every tick exactly as before, so a coin's status still reacts instantly; only the disk-write/log-noise is capped, via a TIME-based per-symbol-per-guard-type cooldown (V4_GUARD_LOG_COOLDOWN_MS, default 5min) rather than a permanent once-ever suppress, since these conditions genuinely change over hours and a real re-entry deserves a fresh line. 9/9 unit tests (independent per-symbol, independent per-guard-type on the same symbol, cooldown boundary, re-entry after cooldown is NOT permanently silenced, size-cap safety valve). node --check clean. Prior .12 — hotfix38, fixLEDGERCACHE. ROOT-CAUSED the reported multi-minute UI connect stalls / red-flapping SRV / apparent Bybit wallet timeouts / growing sentinel staleness. store.read/write (lib/store.js) are fully synchronous (fs.readFileSync/writeFileSync + JSON.parse/stringify) and block Node's single event loop; upsertLedger() — a full read+merge+write of the biggest store in the system (MAX_LEDGER=5000 rows, ~9-12KB/row per hotfix9 = tens of MB at scale) — ran UNCONDITIONALLY at the end of EVERY scan cycle with no changed-gate, same disease class hotfix36 fixed for a per-candidate read, one level worse (full-ledger, every tick). Explains the wallet timeout log lines too: axios's abort timer needs a free event loop to fire, so a long sync block makes a call LOOK late even when Bybit itself wasn't. Fix: in-memory write-through cache scoped to getLedger/saveLedger only — first read/process-lifetime hits disk once, every read after is a shallow array copy from memory (verified via grep that ledger rows are only ever replaced via spread, never mutated in place, so sharing row references across cache reads is safe), writes skip disk when a structural signature (id|paperState|realizedPnl|closedAt, plus mfeR/maeR bucketed to 0.1R so fixMFEALL's excursion data still flushes periodically on an open trade rather than only at close — caught in my own review's unit tests) is unchanged from the last write; any real change always writes. sentinelBrain's separate raw read of the same file (its own staleness source) now routes through this same cache via a lazy require (avoids the circular-require v4Brain<->sentinelBrain would otherwise hit). Reversible: LEDGER_CACHE_ENABLED=false. 17/17 unit tests across two harnesses (cold-start disk hit, cache-served reads, no-op write skip, real-change write, external-mutation isolation, the mfeR/maeR durability tradeoff I caught and fixed in review, reversibility). NOT yet deployed. Prior .11 — hotfix37, three fixes in one drop. (a) fixBAND: the score QUALITY BAND 40-80 replaces hotfix33's RSI zone as the sole candidate admission rule at all 3 enforcement points; score measured by BUCKET (not linear correlation) on 167 resolved signals reads <40=27%WR n=41, 40-80=60%WR n=119, 80+=0%WR n=7 — U-shaped, which is exactly how a real signal reads as r~0 under the old linear test that produced the 'score is dead weight' rule. Validated leave-one-day-out (band wins 6/6 days) and by within-day stratified permutation (36.7pp gap, p=0.0032), with a flat plateau across floors 35-45 and ceilings 75-85 so it is not a fitted knife-edge. Replay on the 07/30-31 bleed window: -2.02U over 33 trades becomes +0.05U over 8. RSI is NOT deleted — demoted to a shadow stamp (rsiGateShadow / rsiGateShadowAtBirth) so it keeps gathering evidence. fork-A's blanket score waiver is deliberately left dormant (it would re-open the hole); fixEUPHADX's promote is rewired to the new reason string and now re-tests the restored score against the band. (b) fixARM: restingOrderWatch re-runs fixKNIFEGUARD's own candle test against an ALREADY-RESTING limit every 10s and cancels through the existing flagTradeForCancel/STALE_CANCELLED path — placement checked momentum once, the order was then exposed unchecked until fill. [Likely, NOT proven: supporting split is fills <30s 50%WR vs 30s+ 76%WR on n=65, within-day permutation p=0.19; judged by the caged session.] Does not re-arm, by design. (c) fixMFEALL: excursion capture (mfeR/maeR) only ever ran on the paper path — both live seams skipped it, so only 65 of 167 resolved rows carried it and the missing ones were the real-money trades. Pure observability, no gate reads it. Prior .10 — hotfix36 (URGENT, real regression): user reported
 // backend timeouts severe enough to force a manual pause — gradual onset, backend-only, frontend
 // fine, tracked the recent v4Brain hotfixes. Traced to Phase 1 (hotfix29): decideLiveEntry() called
 // activeTrades() -> getTrades() -> store.read('trades', {}) on EVERY qualifying candidate, EVERY
@@ -476,7 +447,13 @@ const FINAL_STATES = new Set(['TP_HIT', 'SL_HIT', 'INVALIDATED', 'EXPIRED', 'REJ
 // the exchange owns that signal's fate. These pre-fill kills are the ONLY finals Bybit may overwrite —
 // a genuinely booked outcome (TP_HIT / SL_HIT) is never touched.
 const PAPER_PREFILL_FINALS = new Set(['EXPIRED', 'STALE_CANCELLED', 'INVALIDATED']);
-function isOrderBearing(s) { return !!(s && (s.tradeId || s.orderId || s.orderClaimAt)); }
+function isOrderBearing(s) {
+  return !!(s && (
+    s.tradeId || s.orderId || s.liveOrderId || s.orderClaimAt ||
+    (s.executionPosition?.intent?.status === 'ACCEPTED' &&
+      (paperOrders.working(s.executionPosition) || num(s.executionPosition?.filledQty,0) > 0))
+  ));
+}
 // A paper-final signal that still has an unresolved real order gets one authority pass per tick.
 // liveResolved is stamped once Bybit's verdict is booked, which stops the reclaim loop for good.
 function reclaimableFinal(s) {
@@ -586,7 +563,7 @@ const FLIP_DEFAULT_RR = Math.max(1.0,  Number(process.env.V4_FLIP_DEFAULT_RR || 
 
 // ── fixPCT (Phase 1): PER-COIN MULTI-TF TREND BRAIN ──────────────────────────
 // WHY: the bot was frozen (07/24, 8h no fills) because in a bear regime it wants SELL-only, and the
-// existing counter-regime rescue (fix49k breadthOverrideSide) keys on MARKET-WIDE breadth — never the
+// market permission keys on MARKET-WIDE breadth; per-coin trend remains separate evidence.
 // coin. So DEXE +97% (a clean long) stayed hard-blocked because market breadth read bearish. This reads
 // the COIN's OWN trend across 1m/3m/5m/15m (dropping the lagging 1h that made fresh pumps read 'bear')
 // and does two things, both sides symmetric:
@@ -2289,7 +2266,7 @@ function directionBirthMs(currentRegime) {
   return birth;
 }
 
-function convictionScore(ctx, decision, plan, math, btcRegime, levels) {
+function convictionScore(ctx, decision, plan, math, btcRegime, levels, marketPermission = currentMarketPermission()) {
   const { side } = plan;
   const { price, trend5, trend15, trend1h, rsi, volRatio, momentumPct, ticker, k5 } = ctx;
   const atr = Math.max(num(levels.atr, price * 0.006), price * 0.0005);
@@ -2302,7 +2279,7 @@ function convictionScore(ctx, decision, plan, math, btcRegime, levels) {
 
   const localRegimeData = detectLocalRegime(k5, Array.isArray(ctx.k15) ? ctx.k15 : []);
   const localRegime = localRegimeData.localRegime;
-  const sideAllowance = currentMarketPermission();
+  const sideAllowance = marketPermission;
 
   const components = {};
   const confluence = [];
@@ -2426,9 +2403,10 @@ function convictionScore(ctx, decision, plan, math, btcRegime, levels) {
       _perPair = clamp(_perPair, -1, 1);
 
       // (2) MARKET breadth (secondary) — live vol_bull_pct from sentinel.
-      let _bullPct = 50;
-      try { const { sent: _s } = getSentinelForCapture(); _bullPct = num(_s?.vol?.bull_pct, 50); } catch (_e) {}
-      const _breadth = clamp(((side === 'BUY' ? (_bullPct - 50) : (50 - _bullPct)) / 35), -1, 1);
+      const _bullPct = sideAllowance.usable ? num(sideAllowance.pct, 50) : 50;
+      const _breadth = sideAllowance.usable
+        ? clamp(((side === 'BUY' ? (_bullPct - 50) : (50 - _bullPct)) / 35), -1, 1)
+        : 0;
 
       // combine: per-pair 0.65, breadth 0.35. Penalty steeper than boost.
       const _align = clamp(0.65 * _perPair + 0.35 * _breadth, -1, 1);
@@ -2747,6 +2725,7 @@ function buildStructurePlan(ctx, settings, btcRegime) {
   //
   // fix48's determineDirection is preserved below and still used when DIRECTION_MODE=fade,
   // so this is a routing change, not a deletion.
+  const planPermission = currentMarketPermission();
   let decision;
   const _dirMode = directionMode.getMode();
   if (_dirMode === 'fade') {
@@ -2760,7 +2739,7 @@ function buildStructurePlan(ctx, settings, btcRegime) {
       elliottAnalysis,
     });
   }
-  decision.marketPermission=currentMarketPermission();
+  decision.marketPermission=planPermission;
   if(decision.side!=='NEU' && !marketPolicy.allows(decision.marketPermission,decision.side)) {
     decision={...decision,side:'NEU',reasons:[...(decision.reasons||[]),'BREADTH_SIDE_BLOCKED']};
   }
@@ -2976,7 +2955,7 @@ function buildStructurePlan(ctx, settings, btcRegime) {
   const plan = { entry: roundPrice(entry), sl: roundPrice(sl), tp1: roundPrice(tp1), side };
   const math = calculatePaperMath(plan, settings);
 
-  const scoreInfo = convictionScore(ctx, decision, plan, math, btcRegime, { support, resistance, support2, resistance2, atr, requiredRR: minRRFor(side, settings), minNetTpUsdt: minNetTpFor(settings, math), maxTpAtr: maxTpAtrFor(settings) });
+  const scoreInfo = convictionScore(ctx, decision, plan, math, btcRegime, { support, resistance, support2, resistance2, atr, requiredRR: minRRFor(side, settings), minNetTpUsdt: minNetTpFor(settings, math), maxTpAtr: maxTpAtrFor(settings) }, planPermission);
   const entryTiming = computeEntryTiming(ctx, plan, side, atr, settings);
   const score = scoreInfo.score;
   const contextDiag = scoreInfo?.components?._context || null; // fix48w: direct ref — survives to signal via leader.contextDiag
@@ -3011,6 +2990,7 @@ function buildStructurePlan(ctx, settings, btcRegime) {
     scoring: scoreInfo,
     contextDiag, // fix48w: 48v context breakdown (perPair/breadth/fear) — explicit field so signalFromLeader carries it
     entryTiming,
+    marketPermission: planPermission,
     entrySource, slSource, tpSource,
     keyLevels: { support: roundPrice(support), resistance: roundPrice(resistance), support2: roundPrice(support2), resistance2: roundPrice(resistance2), atr: roundPrice(atr) },
     // fix44f: structure detection metadata
@@ -3038,7 +3018,8 @@ function buildStructurePlan(ctx, settings, btcRegime) {
   const _flipLocalR = String(scoreInfo?.localRegime || '').toUpperCase();
   const _shouldFlip = leader.side === 'BUY' &&
     _flipLocalR === 'LOCAL_BULL' &&
-    ['BULL_TREND', 'BULL_RANGE'].includes(_flipBtcR);
+    ['BULL_TREND', 'BULL_RANGE'].includes(_flipBtcR) &&
+    marketPolicy.allows(planPermission, 'SELL');
 
   if (_shouldFlip && support > 0 && resistance > 0) {
     // Rebuild plan as SELL using the SAME structure levels
@@ -3079,7 +3060,8 @@ function buildStructurePlan(ctx, settings, btcRegime) {
         { support, resistance, support2, resistance2, atr,
           requiredRR: minRRFor('SELL', settings),
           minNetTpUsdt: minNetTpFor(settings, leader.math),
-          maxTpAtr: maxTpAtrFor(settings) }
+          maxTpAtr: maxTpAtrFor(settings) },
+        planPermission
       );
       leader.scoreInfo = _flipScoreInfo;
       leader.scoring   = _flipScoreInfo;
@@ -3424,8 +3406,10 @@ function computeEntryTiming(ctx, plan, side, atr, settings = currentSettings()) 
 function recordWithhold24(s,reason,at,price){
   const episodes=s.withheldEpisodes||(s.withheldEpisodes=[]);
   let e=episodes[episodes.length-1];
-  if(!e||e.reason!==reason){e={reason,firstAt:at,lastAt:at,count:0,firstPrice:price,lastPrice:price,minPrice:price,maxPrice:price,samples:[]};episodes.push(e);require('./executionParity').appendEvent(s,'ORDER_WITHHELD',at,{reason,episode:episodes.length});}
-  e.samples.push([at-e.firstAt,price]);
+  if(!e||e.reason!==reason){e={reason,firstAt:at,lastAt:at,count:0,firstPrice:price,lastPrice:price,minPrice:price,maxPrice:price,samples:[],samplePolicy:'FIRST_63_PLUS_LATEST',omittedSamples:0};episodes.push(e);require('./executionParity').appendEvent(s,'ORDER_WITHHELD',at,{reason,episode:episodes.length});}
+  const sample=[at-e.firstAt,price];
+  if(e.samples.length<64)e.samples.push(sample);
+  else {e.samples[63]=sample;e.omittedSamples=num(e.omittedSamples)+1;}
   e.count++;e.lastAt=at;e.lastPrice=price;e.minPrice=Math.min(e.minPrice,price);e.maxPrice=Math.max(e.maxPrice,price);
 }
 function timingDiagnostics24(s,price,atr,timing){
@@ -3439,9 +3423,18 @@ function timingDiagnostics24(s,price,atr,timing){
   const touch=Number(s.entryZoneTouchPrice)||s.entry;
   const requiredDistance=Math.max(0,s.side==='BUY'?touch-s.entry:s.entry-touch)+reaction;
   const scores=points.map(x=>deriveEntryTimingScore({...leader,price:s.side==='BUY'?s.entry+x:s.entry-x},{inZone:true,directional:true}));
+  const feasibility={assumption:'FROZEN_CURRENT_INPUTS_FAVORABLE_ZONE_CONFIRMATION',reactionRequired:requiredDistance,zoneTolerance:tolerance,reactionFeasible:requiredDistance<=tolerance,min:Math.min(...scores),max:Math.max(...scores),allBlocked:scores.every(x=>x>=threshold)};
+  const rawThresholdExceeded=total>=threshold;
+  // A threshold may distinguish points inside the allowed confirmation zone. It
+  // cannot make every reachable confirmed point in that same zone impossible.
+  // This preserves the configured value (44) and bypasses only the demonstrated
+  // self-contradictory case; it does not turn a missed move into an order.
+  const universalZoneBypass=rawThresholdExceeded && feasibility.reactionFeasible && feasibility.allBlocked;
   return {total,proximityAndPenalties:base,inZoneBonus:timing.inZone?8:0,directionalBonus:timing.directional?14:0,threshold,
-    policyHeld:total>=threshold,meaning:'PROXIMITY_CONFIRMATION_SCORE_NOT_LATENCY',
-    feasibility:{assumption:'FROZEN_CURRENT_INPUTS_FAVORABLE_ZONE_CONFIRMATION',reactionRequired:requiredDistance,zoneTolerance:tolerance,reactionFeasible:requiredDistance<=tolerance,min:Math.min(...scores),max:Math.max(...scores),allBlocked:scores.every(x=>x>=threshold)}};
+    rawThresholdExceeded,policyHeld:rawThresholdExceeded&&!universalZoneBypass,
+    policyAction:universalZoneBypass?'BYPASS_UNIVERSAL_ZONE_BLOCK':rawThresholdExceeded?'HOLD':'ALLOW',
+    bypassReason:universalZoneBypass?'THRESHOLD_BLOCKS_EVERY_REACHABLE_CONFIRMED_PRICE_IN_CONFIGURED_ZONE':null,
+    meaning:'PROXIMITY_CONFIRMATION_SCORE_NOT_LATENCY',feasibility};
 }
 function signalEntryTiming(s, price, atr, now, settings = currentSettings()) {
   const entry = num(s?.entry);
@@ -3813,7 +3806,7 @@ function btcUnknownHighConfidenceOk(leader) {
 
 // fix24-b: btcRegimeDecision updated for 6-state regime labels
 function btcRegimeDecision(leader, settings, btcUnknownException = false) {
-  const permission = currentMarketPermission();
+  const permission = leader.marketPermission || currentMarketPermission();
   leader.marketPermission=permission;
   return {reasons:marketPolicy.allows(permission,leader.side)?[]:['BREADTH_SIDE_BLOCKED_'+leader.side],warnings:[permission.reason],marketPermission:permission};
 }
@@ -3908,7 +3901,7 @@ function shouldReject(leader, settings, signals = []) {
     warnings.push(`SENTINEL_BTC_CONFLICT:sentinel=${sent.market_regime},btcMtf=${leader.btcRegime}`);
   }
 
-  const permission = currentMarketPermission();
+  const permission = leader.marketPermission || currentMarketPermission();
   leader.marketPermission=permission;
   const _sideUp=String(leader.side||'').toUpperCase();
   const _breadthGate={...permission};
@@ -4047,14 +4040,14 @@ function shouldReject(leader, settings, signals = []) {
   // fix47: exempt structureSignal (W5 exhaustion, CHoCH, TRAP, DIVERGENCE) — these ARE the valid
   // counter-trend fades. W5 exhaustion at a bull range top is precisely the highest-conviction SELL.
   const _btcRForSellBlock = String(leader.btcRegime || '').toUpperCase();
-  if (_btcRForSellBlock === 'BULL_RANGE' && leader.side === 'SELL' && !leader.structureSignal && !leader.contrarianFlip) reasons.push('BULL_RANGE_SELL_BLOCKED');
+  if (_btcRForSellBlock === 'BULL_RANGE' && leader.side === 'SELL' && !leader.structureSignal && !leader.contrarianFlip) warnings.push('BTC_CONTEXT_BULL_RANGE_SELL_WARN');
 
   // fix43b: use leader.btcRegime (regimeBrain, 3-TF) not sentRegime (sentinelBrain, disabled/stale)
   const _btcRegimeForSell = String(leader.btcRegime || '').toUpperCase();
   const _isBullRegime = ['BULL_TREND','BULL_RANGE','BREAKOUT','BULL'].includes(_btcRegimeForSell);
   // fix47: also exempt structureSignal from SELL_RR_TOO_HIGH_IN_BULL — W5 exhaustion SELL at bull top
   // targeting a distant support is exactly right — don't cap its TP
-  if (_isBullRegime && leader.side === 'SELL' && leader.math.rr > 2.5 && !leader.structureSignal && !leader.contrarianFlip) reasons.push('SELL_RR_TOO_HIGH_IN_BULL');
+  if (_isBullRegime && leader.side === 'SELL' && leader.math.rr > 2.5 && !leader.structureSignal && !leader.contrarianFlip) warnings.push('BTC_CONTEXT_SELL_RR_HIGH_IN_BULL_WARN');
   if (leader.math.netTpUSDT < minNetTp) reasons.push(`NET_TP_TOO_SMALL_${leader.math.netTpUSDT}_LT_${minNetTp}`);
   if (minNetRR > 0 && num(leader.math.netRr, 0) < minNetRR) reasons.push(`NET_RR_LT_${minNetRR}`);
   if (slPct > 0 && slPct < minSlPct) reasons.push(`SL_TOO_TIGHT_${slPct.toFixed(2)}_LT_${minSlPct}`);
@@ -4308,6 +4301,7 @@ function signalFromLeader(leader, settings) {
 
   return {
     id,
+    sessionId: getSessionState().id,
     source: `backend-planner-${V4_VERSION}`,
     plannerVersion: V4_VERSION,
     sym: leader.symbol,
@@ -4578,8 +4572,7 @@ function tradeKey(s) {
 // It does NOT replace the 3 existing gates and does NOT change any trading behavior — read-only,
 // called nowhere near an order-placement path. Purpose: gather real agreement/divergence data before
 // ever promoting this to be the actual gate paper (and eventually live) uses.
-function decideLiveEntry(s, market, timing, settings, atr, activeCount) {
-  const permission=currentMarketPermission();
+function decideLiveEntry(s, market, timing, settings, atr, activeCount, permission = currentMarketPermission()) {
   s.marketPermission=permission;
   if(!marketPolicy.allows(permission,s.side))return {wouldPlace:false,reason:'BREADTH_SIDE_BLOCKED_'+s.side,marketPermission:permission};
   if (timing.missedMove) return { wouldPlace: false, reason: 'MISSED_MOVE_EXEMPT' };
@@ -4645,8 +4638,8 @@ function normalizeLedgerTrade(s) {
     s.paperState === 'EXPIRED' || s.paperState === 'PAPER_EXPIRED' ? 'EXPIRED' :
     s.paperState === 'STALE_CANCELLED' || s.paperState === 'CANCELLED' ? 'STALE_CANCELLED' :
     s.paperState === 'REJECTED' ? 'REJECTED' :
-    s.paperState === 'PAPER_ACTIVE' || s.paperState === 'LIVE_OPEN' || s.paperState === 'LIVE_RESTING' || s.paperState === 'LIVE_PENDING' || s.paperState === 'FROZEN' ? 'ACTIVE' :
-    (s.paperState === 'WAITING_ENTRY' || s.paperState === 'WAITING_REACTION') ? s.paperState : (s.paperState || s.status || 'UNKNOWN');
+    s.paperState === 'PAPER_ACTIVE' || s.paperState === 'LIVE_OPEN' ? 'ACTIVE' :
+    ['WAITING_ENTRY','WAITING_REACTION','LIVE_RESTING','LIVE_PENDING','FROZEN'].includes(s.paperState) ? 'WAITING_ENTRY' : (s.paperState || s.status || 'UNKNOWN');
 
   const lossReason =
     result === 'LOSS'
@@ -4655,9 +4648,10 @@ function normalizeLedgerTrade(s) {
 
   return ledgerObservability.clone({
     id: s.id || s.signalId || key,
+    sessionId: s.sessionId || null,
     key,
     planKey,
-    patchVersion:'PATCH-2.4',scoreAdmission:s.scoreAdmission||null,marketPermission:s.marketPermission||null,
+    patchVersion:'PATCH-2.4.1',scoreAdmission:s.scoreAdmission||null,marketPermission:s.marketPermission||null,
     missedMoveDiagnostics:s.missedMoveDiagnostics||null,timingDiagnostics:s.timingDiagnostics||null,
     timingHoldCount:s.timingHoldCount||0,withheldEpisodes:s.withheldEpisodes||[],pendingFillDiagnostic:s.pendingFillDiagnostic||null,
     sym: s.sym,
@@ -5649,6 +5643,37 @@ function saveSessions(sessions) {
   store.write('v4_sessions', sessions.slice(0, 50));
 }
 
+function getSessionState() {
+  const raw = store.read('v4_session_state', null);
+  if (raw && raw.id && Number.isFinite(Number(raw.startedAt))) return raw;
+  return { id: 'legacy-session', startedAt: 0, sequence: 1, priorSessionId: null };
+}
+
+function beginSession(at = Date.now(), reason = 'NEW_SESSION') {
+  const prior = getSessionState();
+  const next = {
+    id: `v4s_${at}_${Math.max(2, num(prior.sequence, 1) + 1)}`,
+    startedAt: at,
+    sequence: Math.max(2, num(prior.sequence, 1) + 1),
+    priorSessionId: prior.id,
+    reason
+  };
+  store.write('v4_session_state', next);
+  return next;
+}
+
+function rowsForCurrentSession(rows = getLedger(), session = getSessionState()) {
+  return (rows || []).filter(r => r && (
+    (r.sessionId && r.sessionId === session.id) ||
+    (!r.sessionId && num(r.createdAt, 0) >= num(session.startedAt, 0))
+  ));
+}
+
+function computeSessionSummary(rows = getLedger()) {
+  const session = getSessionState();
+  return { ...computeLedgerSummary(rowsForCurrentSession(rows, session)), session };
+}
+
 function computeSummary(signals = getSignals()) {
   const unique = new Map();
   for (const s of signals) unique.set(s?.id || s?.signalId || ledgerKey(s), s);
@@ -5744,28 +5769,22 @@ function activeFinalFromMarket(s, market, price) {
   return null;
 }
 
-// Legacy active rows predate the execution ledger. Migrate once, explicitly and
-// conservatively: recorded entry/open time becomes a synthetic fill and all older
-// candles remain excluded. We never reconstruct or credit historical partial exits.
+// Legacy active rows predate the execution ledger. A displayed active state and an
+// openedAt value are not execution evidence, so they remain quarantined. Creating a
+// synthetic ACK/fill here would let a historical UI state become a trade and P&L.
 function ensureExecutionPosition(s, now) {
   if (s.executionPosition) return s.executionPosition;
-  const qty=num(s.qty, num(s.position)>0&&num(s.entry)>0?num(s.position)/num(s.entry):0);
-  const openedAt=num(s.openedAt,0), entry=num(s.avgFillPrice,num(s.entry));
-  if (!(qty>0&&openedAt>0&&entry>0)) {
-    s.legacyExecutionBlocked=true;
-    s.stateReason=`${V4_VERSION}: legacy active record quarantined — insufficient execution evidence`;
-    return null;
-  }
-  const parity=require('./executionParity');
-  const intent=parity.createIntent(s, openedAt, {qty,hadFirstTouch:true,requireRetest:false,orderType:'MARKET'});
-  if(intent.status!=='ACCEPTED'){s.legacyExecutionBlocked=true;return null;}
-  const pos=parity.newPosition(intent);
-  parity.acknowledgeOrder(pos,{at:openedAt,orderId:'legacy_migration'});
-  parity.applyFill(pos,{at:openedAt,price:entry,qty,fee:num(s.entryFeeUSDT,0),execId:`legacy_${s.id}`,liquidity:'LEGACY_RECORDED'});
-  pos.lastProcessedThrough=Math.max(openedAt,num(s.lastResolutionCheckTs,openedAt));
-  s.executionIntent=intent;s.executionPosition=pos;s.legacyExecutionMigratedAt=now;
-  parity.appendEvent(s,'LEGACY_POSITION_MIGRATED',now,{openedAt,entry,qty});
-  return pos;
+  s.legacyExecutionBlocked=true;
+  s.entryHit=false;
+  s.paperState='REJECTED';
+  s.displayState='REJECTED';
+  s.status='REJECTED';
+  s.positionStatus='NONE';
+  s.closedAt=now;
+  s.stateReason=`${V4_VERSION}: legacy active record quarantined — no accepted intent, ACK and fill evidence`;
+  s.history=[...(s.history||[]),{at:now,state:'REJECTED',reason:s.stateReason}];
+  observeDecision24(s,'ORDER_REJECTED','LEGACY_ACTIVE_WITHOUT_EXECUTION_EVIDENCE',now,{lastPrice:s.backendLastPrice,sourceAt:s.lastPriceSourceAt,receivedAt:s.lastPriceReceivedAt});
+  return null;
 }
 
 // fix48d: rich per-trade diagnostic capture — pure observability, NO gating.
@@ -5994,8 +6013,8 @@ function finalizeActiveDiagnostics(s, now) {
 //   FREEZE  → conditions temporarily hostile; don't activate this tick but keep waiting (may recover).
 //   OK      → thesis intact; normal timing logic proceeds.
 // `market` may carry fresh 5m context (closes5/rsi5/atr5) injected by enrichOpenSignalMarketMap.
-function revalidateWaitingSignal(s, market, price, now) {
-  s.marketPermission=currentMarketPermission(now);
+function revalidateWaitingSignal(s, market, price, now, permission = currentMarketPermission(now)) {
+  s.marketPermission=permission;
   const side = String(s.side || '').toUpperCase();
   const age = now - num(s.createdAt, now);
   if (age < REVAL_MIN_AGE_MS) return { action: 'OK', reason: '' };
@@ -6004,8 +6023,6 @@ function revalidateWaitingSignal(s, market, price, now) {
   const riskAbs = Math.abs(entry - sl) || 0;
 
   // Breadth-first: BTC cannot cancel a compatible waiting side.
-  const permission=currentMarketPermission(now);
-  s.marketPermission=permission;
   // ── 2. ADVERSE PRE-ENTRY DRIFT ───────────────────────────────────────────
   // If price has already drifted toward SL by > REVAL_ADVERSE_DRIFT_FRAC of the entry→SL distance
   // BEFORE the trade even fills, the structure is breaking. Don't buy a falling knife into the limit.
@@ -6045,7 +6062,6 @@ function revalidateWaitingSignal(s, market, price, now) {
   // thresholds + same getSentinelForCapture() snapshot the creation gate uses. Fails OPEN on a
   // stale/missing breadth read (never freezes the system on a data gap).
   try {
-    const permission=currentMarketPermission(now);
     const BUY_MIN_BREADTH=permission.buyMinExclusive, SELL_MAX_BREADTH=permission.sellMaxExclusive;
     const _bPct=permission.pct, _bUsable=permission.usable;
     if (!_bUsable) s._breadthFightSince=0;
@@ -6333,6 +6349,7 @@ function updateExistingSignals(signals, priceMap) {
   const settings = currentSettings();
   let changed = false;
   observations.observe(priceMap,now);
+  const scanPermission=currentMarketPermission(now);
   const _flipChildren = []; // fixFLIP: opposite-side children built mid-loop, appended after iteration
   // fixPHASE1PERF (07/31, hotfix36) — REAL BUG, confirmed via user's reported backend timeouts
   // (gradual, backend-only, tracked the recent v4Brain hotfixes — pointed straight here). Phase 1's
@@ -6356,6 +6373,7 @@ function updateExistingSignals(signals, priceMap) {
     if (_finalNow && !reclaimableFinal(s) && !latePaperOrder) continue;
 
     const market = priceMap.get(s.sym) || priceMap.get(s.symbol) || {};
+    s.marketPermission=scanPermission;
     const price = num(market.lastPrice || market.markPrice || market.close || s.backendLastPrice);
     const prevState = s.paperState;
     const q24=paperOrders.quote(market,now);
@@ -6372,7 +6390,7 @@ function updateExistingSignals(signals, priceMap) {
       if(fill.filled){
         s.avgFillPrice=p.avgFillPrice;s.entryHit=true;s.openedAt=p.openedAt;s.closedAt=null;
         s.paperState='PAPER_ACTIVE';s.status='ACTIVE';s.displayState='PAPER_ACTIVE';s.positionStatus='PAPER';
-        s.executionReason='PATCH-2.4: acknowledged limit filled on later fresh retrace';s.stateReason=s.executionReason;
+        s.executionReason='PATCH-2.4.1: acknowledged limit filled on later fresh retrace';s.stateReason=s.executionReason;
         s.history=[...(s.history||[]),{at:p.openedAt,state:'PAPER_ACTIVE',reason:s.executionReason,intentId:p.intent.intentId,price:q24.price,qty:p.filledQty}];
         if(!s._paper24DiagnosticsInitialized){initActiveDiagnostics(s,q24.price,num(s.planner?.keyLevels?.atr,Math.abs(p.intent.plannedEntry-p.intent.sl)),now,settings);s._paper24DiagnosticsInitialized=true;}
         observations.link(s);changed=true;
@@ -6381,16 +6399,16 @@ function updateExistingSignals(signals, priceMap) {
         // A partial entry leaves a real open position. Cancel remaining size on a
         // later adverse/expiry decision; never erase the filled quantity.
         if(paperOrders.working(p)){
-          const rv=q24.valid?revalidateWaitingSignal({...s,entry:p.intent.plannedEntry,sl:p.intent.sl},market,q24.price,now):{action:'OK'};
+          const rv=q24.valid?revalidateWaitingSignal({...s,entry:p.intent.plannedEntry,sl:p.intent.sl},market,q24.price,now,scanPermission):{action:'OK'};
           if(rv.action!=='OK'||now-signalBirthMs(s)>Math.min(num(s.expireMs,expiryMsFor(settings)),WAITING_HARD_CAP_MS))paperOrders.cancel(p,now,rv.reason||'EXPIRED_REMAINDER');
         }
         if(fill.filled){changed=true;continue;}
       } else {
-        const rv=q24.valid?revalidateWaitingSignal({...s,entry:p.intent.plannedEntry,sl:p.intent.sl},market,q24.price,now):{action:'OK'};
+        const rv=q24.valid?revalidateWaitingSignal({...s,entry:p.intent.plannedEntry,sl:p.intent.sl},market,q24.price,now,scanPermission):{action:'OK'};
         const expired=now-signalBirthMs(s)>Math.min(num(s.expireMs,expiryMsFor(settings)),WAITING_HARD_CAP_MS);
         if(expired||isDeadHourLK(now)||rv.action!=='OK'||(q24.valid&&!require('./executionParity').geometry(p.intent.side,q24.price,p.intent.sl,p.intent.tp).ok)){
           const reason=expired?'ORDER_EXPIRED':rv.reason||'ORDER_SAFETY_CANCEL';paperOrders.cancel(p,now,reason);
-          s.paperState=expired?'EXPIRED':'STALE_CANCELLED';s.status=s.paperState;s.displayState=s.paperState;s.closedAt=now;s.stateReason=reason;
+          s.paperState=expired?'EXPIRED':'STALE_CANCELLED';s.status=s.paperState;s.displayState=s.paperState;s.positionStatus='NONE';s.entryHit=false;s.closedAt=now;s.stateReason=reason;
           s.history=[...(s.history||[]),{at:now,state:s.paperState,reason}];
           observeDecision24(s,s.paperState,reason,now,market);
         } else {s.paperState='WAITING_ENTRY';s.displayState='PAPER_PENDING_FILL';}
@@ -6639,7 +6657,7 @@ function updateExistingSignals(signals, priceMap) {
       }
       // fix48e: ADAPTIVE RE-VALIDATION — re-check the live market thesis before allowing fill.
       // Runs every tick while waiting. Abandons dead setups, freezes hostile-but-recoverable ones.
-      const reval = revalidateWaitingSignal(s, market, price, now);
+      const reval = revalidateWaitingSignal(s, market, price, now, scanPermission);
       if (reval.action === 'ABANDON') {
         s.paperState = 'STALE_CANCELLED';
         s.status = 'STALE_CANCELLED';
@@ -6673,7 +6691,7 @@ function updateExistingSignals(signals, priceMap) {
       // fixPHASE1: shadow-only — compares the unified decision engine against what actually happened.
       // Zero effect on the branches below (no mutation, no continue/return, purely a log side-effect).
       try {
-        const _p1Verdict = decideLiveEntry(s, market, timing, settings, atr, _p1ActiveCount);
+        const _p1Verdict = decideLiveEntry(s, market, timing, settings, atr, _p1ActiveCount, scanPermission);
         const _p1ActuallyLive = !!(s.liveOrderId || s.tradeId);
         phase1ShadowTrace(s, _p1Verdict, _p1ActuallyLive);
       } catch (_p1e) { /* shadow only — never let it touch the real tick loop */ }
@@ -6731,7 +6749,7 @@ function updateExistingSignals(signals, priceMap) {
         }
         phase0Trace(s, 'WITHHELD_KNIFE_RETEST', { knife: 'withheld' });
       } else if (settings.botMode === 'LIVE_REAL_BYBIT' && settings.tradingEnabled && s.hadFirstTouch &&
-          !timing.missedMove && timing.inZone && timing.directional && !s.timingDiagnostics.policyHeld && passesScoreBand(s.score) && marketPolicy.allows(currentMarketPermission(now),s.side) && !s._autoTraded && !s.liveOrderId && !s.tradeId) {
+          !timing.missedMove && timing.inZone && timing.directional && !s.timingDiagnostics.policyHeld && passesScoreBand(s.score) && marketPolicy.allows(scanPermission,s.side) && !s._autoTraded && !s.liveOrderId && !s.tradeId) {
         const { placeLimitAtEntry: _placeLimitRetest, activeTrades: _atRetest } = require('./executor');
         if (sentinelBlind()) {
           addLog('LIVE_BLIND_SKIP', `${s.symbol} ${s.side} — sentinel blind >10min, resting limit withheld`);
@@ -6824,7 +6842,7 @@ function updateExistingSignals(signals, priceMap) {
         // but below the =100 chase extreme. Block activation; let the hard cap expire it if it never improves.
         // Tunable/disable-able via env without a redeploy of logic: V4_TIMING_BLOCK_THRESHOLD (default 44; set 999 to disable).
         const _timingBlockAt = Math.max(1, Number(process.env.V4_TIMING_BLOCK_THRESHOLD || '44'));
-        if (_activationTimingScore >= _timingBlockAt) {
+        if (s.timingDiagnostics.policyHeld) {
           changed = true;
           s.timingHoldCount=num(s.timingHoldCount)+1;
           recordWithhold24(s,'ENTRY_TIMING_TOO_HIGH',now,price);
@@ -6837,6 +6855,14 @@ function updateExistingSignals(signals, priceMap) {
           s.stateReason = `${V4_VERSION}: ENTRY_TIMING=${_activationTimingScore} >= ${_timingBlockAt} (timing-score policy hold; not a latency measurement) — held in WAITING, not activated`;
           appendSignalDiagnostic('ENTRY_TIMING_TOO_HIGH', s, { prevState, price, timing, timingScore: _activationTimingScore, threshold: _timingBlockAt }, settings);
           continue;
+        }
+        if (s.timingDiagnostics.policyAction === 'BYPASS_UNIVERSAL_ZONE_BLOCK') {
+          s.timingFeasibilityBypassCount = num(s.timingFeasibilityBypassCount) + 1;
+          appendSignalDiagnostic('ENTRY_TIMING_FEASIBILITY_BYPASS', s, {
+            prevState, price, timing, timingScore: _activationTimingScore,
+            threshold: _timingBlockAt, feasibility: s.timingDiagnostics.feasibility,
+            reason: s.timingDiagnostics.bypassReason
+          }, settings);
         }
         // fix52: DEAD-HOUR FILL BLOCK. Entry conditions are met at THIS instant — gating here (not at
         // signal creation) is the whole point: it kills exactly the in-window fills the old creation-
@@ -6942,7 +6968,7 @@ function updateExistingSignals(signals, priceMap) {
         const parity = require('./executionParity');
         const _qty = num(s.position) > 0 && num(s.entry) > 0 ? num(s.position) / num(s.entry) : num(s.qty);
         const _activeCount = signals.filter(x => x && x.id !== s.id && (x.paperState === 'PAPER_ACTIVE' || paperOrders.working(x.executionPosition))).length;
-        const _eligibility = passesScoreBand(s.score) ? decideLiveEntry(s, market, timing, settings, atr, _activeCount) : {wouldPlace:false,reason:scoreBandReason(s.score)};
+        const _eligibility = passesScoreBand(s.score) ? decideLiveEntry(s, market, timing, settings, atr, _activeCount, scanPermission) : {wouldPlace:false,reason:scoreBandReason(s.score)};
         // decideLiveEntry is the single authority for first-touch/retest and every
         // other normalized gate. Do not apply a second, divergent retest rule here.
         const _intent = parity.createIntent(s, now, { missedMove:false, hadFirstTouch:!!s.hadFirstTouch, requireRetest:false, qty:_qty, eligibility:_eligibility });
@@ -6955,7 +6981,7 @@ function updateExistingSignals(signals, priceMap) {
         s.executionIntent=_intent;s.executionPosition=_position;
         s.paperState='WAITING_ENTRY';s.displayState='PAPER_PENDING_FILL';s.status='DETECTED';s.positionStatus='NONE';s.entryHit=false;
         s.entryTimingScore=_activationTimingScore;s.timingReason=timing.reason;
-        s.executionReason='PATCH-2.4: accepted and acknowledged; awaiting later fresh limit retrace';
+        s.executionReason='PATCH-2.4.1: accepted and acknowledged; awaiting later fresh limit retrace';
         changed=true;continue;
         // fixORTRIGGER        // fixORTRIGGER (4.6.9.1): FARTCOIN/AAVE/NEAR proof (07/29 chat, real ledger evidence, 3 confirmed
         // instances) — paper activates HERE the moment timing.directional confirms, first touch or
@@ -8225,7 +8251,7 @@ function ingestCandidate(payload = {}) {
   if (targetDistanceAtr && targetDistanceAtr > effectiveMaxTpAtrIngest * 1.10) reasons.push(`TP_TOO_FAR_${targetDistanceAtr.toFixed(2)}ATR_GT_${effectiveMaxTpAtrIngest.toFixed(1)}`);
   if (!targetDistanceAtr && targetDistancePct > maxFrontendTpPct) reasons.push(`TP_TOO_FAR_${targetDistancePct.toFixed(2)}PCT_GT_${maxFrontendTpPct}`);
 
-  const btcDecision = btcRegimeDecision({ side, btcRegime: btcRegime || 'unknown', score, math: { rr }, reasons: [], risks: [] }, settings, false);
+  const btcDecision = btcRegimeDecision({ side, btcRegime: btcRegime || 'unknown', score, math: { rr }, reasons: [], risks: [], marketPermission }, settings, false);
   reasons.push(...btcDecision.reasons);
   warnings.push(...btcDecision.warnings);
 
@@ -8305,6 +8331,7 @@ function ingestCandidate(payload = {}) {
   const sig = {
     marketPermission,priceAtBirth:num(payload.price,NaN),scoreAdmission:{raw:score,adjusted:score,final:score,policy:{minInclusive:40,maxExclusive:80},pass:passesScoreBand(score)},
     id: `v4c_${symbol}_${side}_${now}`,
+    sessionId: getSessionState().id,
     source: payload.source || `backend-retry-${V4_VERSION}`, // fix47: use caller's source — never default to frontend label
     plannerVersion: V4_VERSION,
     sym: symbol,
@@ -8393,7 +8420,7 @@ function ingestCandidate(payload = {}) {
 function getSnapshot() {
   const persisted = store.read('v4_snapshot', null);
   if (persisted && persisted.ts && (!snapshot.ts || persisted.ts > snapshot.ts)) snapshot = persisted;
-  const signals = getSignals(); const ledger = upsertLedger(signals); return { ...snapshot, signals, visibleSignals: signals.length, ledger: ledger.slice(0, RECENT_LEDGER_LIMIT), summary: { ...computeLedgerSummary(ledger), visible: computeSummary(signals), source: 'v4_paper_ledger' }, settings: currentSettings(), lastError };
+  const signals = getSignals(); const ledger = upsertLedger(signals); return { ...snapshot, ok:true, version:V4_VERSION, session:getSessionState(), signals, visibleSignals: signals.length, ledger: ledger.slice(0, RECENT_LEDGER_LIMIT), summary: { ...computeLedgerSummary(ledger), session:computeSessionSummary(ledger), visible: computeSummary(signals), source: 'v4_paper_ledger' }, settings: currentSettings(), lastError };
 }
 
 function start() {
@@ -8744,56 +8771,78 @@ function cancelSignal({ id = '', signalId = '', symbol = '', side = '', reason =
 }
 
 function clearSignals({ archive = true, clearLedger = false } = {}) {
-  // fix39b: stamp the reset time so globalRiskBlockReason ignores pre-reset losses
-  store.write('v4_risk_reset_ts', { ts: Date.now() });
+  if (!clearLedger) return startNewSession({ archive, reason: 'NEW_SESSION' });
+  const now = Date.now();
   const signals = getSignals();
   const ledgerBefore = upsertLedger(signals);
+  const unresolved = signals.filter(s => s && (
+    s.tradeId || s.liveOrderId || s.paperState === 'PAPER_ACTIVE' ||
+    paperOrders.working(s.executionPosition) || num(s.executionPosition?.filledQty, 0) > 0
+  ));
+  if (unresolved.length) {
+    const err = new Error(`LEDGER_CLEAR_BLOCKED_UNRESOLVED_POSITIONS_${unresolved.length}`);
+    err.code = 'LEDGER_CLEAR_BLOCKED';
+    err.unresolved = unresolved.map(s => ({ id:s.id, symbol:s.symbol||s.sym, side:s.side, state:s.paperState }));
+    throw err;
+  }
   if (archive && signals.length) {
     const sessions = getSessions();
-    sessions.unshift({ at: Date.now(), summary: computeSummary(signals), ledgerSummary: computeLedgerSummary(ledgerBefore), signals });
+    sessions.unshift({ at: now, session:getSessionState(), summary: computeSummary(signals), ledgerSummary: computeLedgerSummary(ledgerBefore), signals });
     saveSessions(sessions);
   }
+  try { recordPermanentResults(ledgerBefore); updateAllTimePnl(ledgerBefore); } catch (_e) {}
   saveSignals([]);
-  if (clearLedger) {
-    // ── fixCLEARLEDGER: FORCE the wipe past the hotfix38 write-through cache ──────────
-    // saveLedger() skips the disk write when the structural signature is unchanged. It also
-    // runs the full dedupe/merge pipeline, which is pointless for an empty array. Worse, the
-    // process has been OOM-crashing (see fixOOM) — if a clear only landed in the in-memory
-    // cache and V8 killed the process before any later flush, the next boot read the OLD
-    // ledger straight back off disk and the clear silently un-did itself.
-    // Belt and braces: reset the cache AND write [] to disk directly, unconditionally.
-    try {
-      store.write('v4_paper_ledger', []);
-      _ledgerCache = [];
-      _ledgerCacheSig = null;          // force the NEXT real write to flush too
-      console.warn('[v4] LEDGER CLEARED — cache reset and empty array written to disk');
-    } catch (e) {
-      console.error('[v4] LEDGER CLEAR FAILED:', e && e.message);
-      throw e;                          // surface to the route so the UI shows a real error
-    }
-  }
-  store.write('trades', {}); // fix44b: clear trade slots on session reset
-  store.write('v4_candidate_rejections', []); // fix44d: clear stale rejections on session reset
-  const ledger = clearLedger ? [] : getLedger();
-  snapshot = { ...snapshot, signals: [], visibleSignals: 0, ledger: ledger.slice(0, RECENT_LEDGER_LIMIT), summary: { ...computeLedgerSummary(ledger), visible: computeSummary([]), source: 'v4_paper_ledger' }, ts: Date.now() };
+  store.write('v4_paper_ledger', []);
+  _ledgerCache = [];
+  _ledgerCacheSig = null;
+  store.write('trades', {});
+  store.write('v4_candidate_rejections', []);
+  store.write('v4_risk_reset_ts', { ts: now });
+  const session=beginSession(now,'LEDGER_CLEAR');
+  const diskRows=store.read('v4_paper_ledger',null);
+  if(!Array.isArray(diskRows)||diskRows.length)throw new Error('LEDGER_CLEAR_DURABILITY_VERIFY_FAILED');
+  const ledger = [];
+  snapshot = { ...snapshot, ok:true, version:V4_VERSION, signals: [], visibleSignals: 0, ledger: [], summary: { ...computeLedgerSummary(ledger), session:computeSessionSummary(ledger), visible: computeSummary([]), source: 'v4_paper_ledger' }, session, ts: now };
   store.write('v4_snapshot', snapshot);
-  return { ok: true, archived: archive && signals.length ? 1 : 0, total: 0, ledgerTotal: ledger.length, ledgerCleared: !!clearLedger };
+  return { ok: true, archived: archive && signals.length ? 1 : 0, total: 0, ledgerTotal: 0, ledgerCleared: true, durableReadbackTotal:diskRows.length, session };
 }
 
+function startNewSession({archive=true,reason='NEW_SESSION'}={}) {
+  const now=Date.now(),signals=getSignals(),ledgerBefore=upsertLedger(signals),priorSession=getSessionState();
+  if(archive && signals.length){
+    const sessions=getSessions();
+    sessions.unshift({at:now,session:priorSession,summary:computeSummary(signals),ledgerSummary:computeSessionSummary(ledgerBefore),signals});
+    saveSessions(sessions);
+  }
+  const carry=[];
+  for(const s of signals){
+    const mustCarry=s && (s.tradeId||s.liveOrderId||s.paperState==='PAPER_ACTIVE'||paperOrders.working(s.executionPosition)||num(s.executionPosition?.filledQty,0)>0);
+    if(mustCarry){carry.push(s);continue;}
+    if(s&&!FINAL_STATES.has(s.paperState)){
+      s.paperState='STALE_CANCELLED';s.status='STALE_CANCELLED';s.displayState='STALE_CANCELLED';s.positionStatus='NONE';s.closedAt=now;
+      s.stateReason=`${V4_VERSION}: session boundary closed unplaced setup; no fill`;
+      s.history=[...(s.history||[]),{at:now,state:'STALE_CANCELLED',reason:s.stateReason}];
+      observeDecision24(s,'STALE_CANCELLED','SESSION_BOUNDARY_UNPLACED',now,{lastPrice:s.backendLastPrice,sourceAt:s.lastPriceSourceAt,receivedAt:s.lastPriceReceivedAt});
+    }
+  }
+  const ledger=upsertLedger(signals);
+  saveSignals(carry);
+  const keepTradeIds=new Set(carry.map(s=>s.tradeId).filter(Boolean));
+  const trades=store.read('trades',{}),keptTrades={};
+  for(const id of keepTradeIds)if(trades[id])keptTrades[id]=trades[id];
+  store.write('trades',keptTrades);
+  store.write('v4_candidate_rejections',[]);
+  store.write('v4_risk_reset_ts',{ts:now});
+  const session=beginSession(now,reason);
+  snapshot={...snapshot,ok:true,version:V4_VERSION,ts:now,session,signals:carry,visibleSignals:carry.length,ledger:ledger.slice(0,RECENT_LEDGER_LIMIT),summary:{...computeLedgerSummary(ledger),session:computeSessionSummary(ledger),visible:computeSummary(carry),source:'v4_paper_ledger'}};
+  store.write('v4_snapshot', snapshot);
+  const persisted=store.read('v4_session_state',null);
+  if(!persisted||persisted.id!==session.id)throw new Error('NEW_SESSION_DURABILITY_VERIFY_FAILED');
+  return {ok:true,archived:archive&&signals.length?1:0,cleared:signals.length-carry.length,carried:carry.length,ledgerTotal:ledger.length,ledgerCleared:false,historyPreserved:true,session};
+}
 
 function freshJournal() {
-  saveSignals([]);
-  saveLedger([]);
-  store.write('trades', {}); // fix44b: clear trade slots on fresh session
-  store.write('v4_candidate_rejections', []); // fix44d: clear stale rejections on fresh session
-  // fix44a: v4_candidate_rejections clear removed (system disabled)
-  store.write('v4_diagnostic_journal', []);
-  if (typeof store.clearNdjson === 'function') store.clearNdjson('v4_diagnostic_journal');
-  diagnosticRecentCache = [];
-  store.write('legacy_browser_signals', { at: Date.now(), total: 0, note: `cleared by v${V4_VERSION} freshJournal` });
-  snapshot = { ...snapshot, ts: Date.now(), signals: [], visibleSignals: 0, ledger: [], summary: computeLedgerSummary([]) };
-  store.write('v4_snapshot', snapshot);
-  return { ok: true, cleared: true, source: `v${V4_VERSION} freshJournal` };
+  return startNewSession({archive:true,reason:'FRESH_JOURNAL_COMPAT'});
 }
 
 function getLeaderboard() {
@@ -8859,7 +8908,7 @@ module.exports = {
   getKlineCacheStats: () => ({ size: _klineCache.size, cap: KLINE_CACHE_MAX }),
   MAX_LEDGER_ACTIVE: MAX_LEDGER,
   RISK_DEFAULT_ACTIVE: 0.25, // fixSIZECAP: proves the risk-per-trade default fix is loaded
-  getConfigFlags: () => ({ FIXCONFIRM_ENTRY_MARKET, patchVersion:'PATCH-2.4', sourceHash:patch24Identity.sourceHash, sourceHashes:patch24Identity.sourceHashes, marketPolicy:marketPolicy.VERSION, scorePolicy:{minInclusive:40,maxExclusive:80}, timingBlockThreshold:Number(process.env.V4_TIMING_BLOCK_THRESHOLD||44), maxPriceAgeMs:paperOrders.MAX_PRICE_AGE_MS, fixRetestEnabled: true, restingWatchMs: RESTING_WATCH_MS, ledgerObservabilitySchema: LEDGER_OBSERVABILITY_SCHEMA }), // fixVERIFY (07/26): lets /health report the live value of entry-placement flags directly from the running process, so a deploy can be confirmed correct with zero live trades — needed because these hooks only fire when tradingEnabled=true, so logs alone can't verify a dry/warmup run.
+  getConfigFlags: () => ({ FIXCONFIRM_ENTRY_MARKET, patchVersion:'PATCH-2.4.1', sourceHash:patch24Identity.sourceHash, sourceHashes:patch24Identity.sourceHashes, marketPolicy:marketPolicy.VERSION, scorePolicy:{minInclusive:40,maxExclusive:80}, timingBlockThreshold:Number(process.env.V4_TIMING_BLOCK_THRESHOLD||44), timingUniversalZoneBypass:true, maxPriceAgeMs:paperOrders.MAX_PRICE_AGE_MS, fixRetestEnabled: true, restingWatchMs: RESTING_WATCH_MS, ledgerObservabilitySchema: LEDGER_OBSERVABILITY_SCHEMA, rejectedObservationSchema:observations.SCHEMA }), // fixVERIFY (07/26): lets /health report the live value of entry-placement flags directly from the running process, so a deploy can be confirmed correct with zero live trades — needed because these hooks only fire when tradingEnabled=true, so logs alone can't verify a dry/warmup run.
   getLedgerReconcileStats, // fix49s: zombie-reconcile heartbeat — lastAt/totalReconciled for /health
   start,
   stop,
@@ -8874,7 +8923,11 @@ module.exports = {
   ledgerRowSignature: _ledgerRowSig, // Patch 2.2: proves execution-only changes invalidate write-skip cache
   LEDGER_OBSERVABILITY_SCHEMA,
   computeLedgerSummary,
+  computeSessionSummary,
+  getSessionState,
+  rowsForCurrentSession,
   clearSignals,
+  startNewSession,
   computeSummary,
   getLeaderboard,
   getDiagnostics,
