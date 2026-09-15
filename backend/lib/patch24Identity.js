@@ -13,5 +13,15 @@ const files={
   'frontend/index.html':'../../frontend/index.html',
   'frontend/orayan-v4-hotfix.js':'../../frontend/orayan-v4-hotfix.js'
 };
-const sourceHashes=Object.fromEntries(Object.entries(files).map(([name,file])=>[name,hash(fs.readFileSync(path.join(__dirname,file)))]));
+const sourceHashes=Object.fromEntries(Object.entries(files).map(([name,file])=>{
+  const target=path.join(__dirname,file);
+  // The frontend is deployed as a separate service in production and is outside
+  // Northflank's /backend Docker build context. Missing sibling frontend files
+  // must not prevent the backend from booting. Backend/runtime files remain strict.
+  if(!fs.existsSync(target)){
+    if(name.startsWith('frontend/')) return [name,'SEPARATE_FRONTEND_NOT_IN_BACKEND_IMAGE'];
+    throw new Error(`Required Patch 2.4.1 source file missing: ${name} (${target})`);
+  }
+  return [name,hash(fs.readFileSync(target))];
+}));
 module.exports={patchVersion:'PATCH-2.4.1',sourceHashes,sourceHash:hash(JSON.stringify(sourceHashes)),configHash:settings=>hash(JSON.stringify(settings))};
