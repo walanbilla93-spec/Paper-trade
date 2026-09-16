@@ -98,13 +98,13 @@ router.get('/stats', auth, (req, res) => {
 router.get('/ledger', auth, (req, res) => {
   const ledger = v4.getLedger();
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4.2', observationSummary:(()=>{const o=v4.getRejectedObservations();return {schema:o.schema,total:o.rows?.length||0,health:o.health,format:o.format};})(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), sessionSummary:v4.computeSessionSummary(ledger), rows: ledger });
+  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4.4', observationSummary:(()=>{const o=v4.getRejectedObservations();return {schema:o.schema,total:o.rows?.length||0,health:o.health,format:o.format};})(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), sessionSummary:v4.computeSessionSummary(ledger), rows: ledger });
 });
 
 router.get('/journal', auth, (req, res) => {
   const ledger = v4.getLedger();
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4.2', rejectedOpportunityObservations:v4.getRejectedObservations(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), sessionSummary:v4.computeSessionSummary(ledger), rows: ledger });
+  res.json({ ok: true, ledgerObservabilitySchema: v4.LEDGER_OBSERVABILITY_SCHEMA, source: 'v4_paper_ledger', patchVersion:'PATCH-2.4.4', rejectedOpportunityObservations:v4.getRejectedObservations(), total: ledger.length, summary: v4.computeLedgerSummary(ledger), sessionSummary:v4.computeSessionSummary(ledger), rows: ledger });
 });
 
 // fixPHASE2: real opportunity-cost check on EXPIRED signals (excludes non-crypto/TradFi symbols).
