@@ -20,8 +20,8 @@ const sourceHashes=Object.fromEntries(Object.entries(files).map(([name,file])=>{
   // must not prevent the backend from booting. Backend/runtime files remain strict.
   if(!fs.existsSync(target)){
     if(name.startsWith('frontend/')) return [name,'SEPARATE_FRONTEND_NOT_IN_BACKEND_IMAGE'];
-    throw new Error(`Required Patch 2.4.1 source file missing: ${name} (${target})`);
+    throw new Error(`Required Patch 2.4.4 source file missing: ${name} (${target})`);
   }
   return [name,hash(fs.readFileSync(target))];
 }));
-module.exports={patchVersion:'PATCH-2.4.2',sourceHashes,sourceHash:hash(JSON.stringify(sourceHashes)),configHash:settings=>hash(JSON.stringify(settings))};
+module.exports={patchVersion:'PATCH-2.4.4',sourceHashes,sourceHash:hash(JSON.stringify(sourceHashes)),configHash:settings=>hash(JSON.stringify(settings))};
