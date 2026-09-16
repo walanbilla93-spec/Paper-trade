@@ -24,4 +24,4 @@ const sourceHashes=Object.fromEntries(Object.entries(files).map(([name,file])=>{
   }
   return [name,hash(fs.readFileSync(target))];
 }));
-module.exports={patchVersion:'PATCH-2.4.1',sourceHashes,sourceHash:hash(JSON.stringify(sourceHashes)),configHash:settings=>hash(JSON.stringify(settings))};
+module.exports={patchVersion:'PATCH-2.4.2',sourceHashes,sourceHash:hash(JSON.stringify(sourceHashes)),configHash:settings=>hash(JSON.stringify(settings))};
